@@ -69,10 +69,10 @@ AuthStorage resolves **every** OAuth provider from it, Codex included. The
 **`docker` backend** runs the call in-guest, but in production it mounts the
 harness state dir at `/data`, so the same store is readable as `/data/auth.json`:
 the orchestrator passes the host path and `src/sandbox/docker.ts` maps it to the
-in-guest path and appends `--auth-file`. Codex therefore runs there too. The map
-follows the real mount: under `scripts/dev-local.sh` the guest sees only
-`$STATE_DIR/sandbox-data`, so the default store is not visible and the driver
-warns instead of passing a wrong path. The remaining
+in-guest path and appends `--auth-file`. Codex therefore runs there too.
+`scripts/dev-local.sh` bind-mounts the state dir itself, so local dev matches.
+The map follows the real mount: when `SANDBOX_DATA_VOLUME` is a directory that
+does not hold the store, the driver warns instead of passing a wrong path. The remaining
 **container backends** (`smol`) mount no store, so `agent-executor.ts` injects
 `ANTHROPIC_OAUTH_TOKEN` / `COPILOT_GITHUB_TOKEN` instead — and Codex has no
 in-guest env route, so it cannot authenticate *there* (the executor warns and

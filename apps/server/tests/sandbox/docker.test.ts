@@ -289,9 +289,17 @@ describe("DockerSandbox.runAgent — OAuth credential store via the /data mount"
     expect(shCmd).toContain("--auth-file /data/auth.json");
   });
 
-  describe("bind mount of a host path (local dev)", () => {
-    // What `scripts/dev-local.sh` sets: the guest sees only a subdirectory of
-    // the state dir.
+  it("maps the default store when the bind mount is the state dir (scripts/dev-local.sh)", async () => {
+    process.env.SANDBOX_DATA_VOLUME = STATE_DIR;
+    const shCmd = await runWith(`${STATE_DIR}/auth.json`);
+    expect(shCmd).toContain("--auth-file /data/auth.json");
+    expect(warnSpy.mock.calls.some(([m]) => String(m).includes(OUTSIDE_MOUNT))).toBe(false);
+  });
+
+  describe("bind mount of a subdirectory of the state dir", () => {
+    // What `scripts/dev-local.sh` set before (`$STATE_DIR/sandbox-data`), and
+    // what the docker integration tests still set: the guest sees only a
+    // subdirectory of the state dir.
     const DEV_STATE_DIR = "/home/dev/lastlight/state";
     const DEV_DATA = `${DEV_STATE_DIR}/sandbox-data`;
 

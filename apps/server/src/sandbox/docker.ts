@@ -315,8 +315,8 @@ export class DockerSandbox {
    * this, so the mount and the path translation cannot diverge.
    *
    * - A host path in `SANDBOX_DATA_VOLUME` (local dev) is a bind mount, so the
-   *   guest sees that directory. `scripts/dev-local.sh` sets it to
-   *   `$STATE_DIR/sandbox-data`, which is a subdirectory of the state dir.
+   *   guest sees that directory. `scripts/dev-local.sh` sets it to the state
+   *   dir. Another directory can hold no store at all.
    * - A Docker volume name (production) gives no host path. The standard
    *   docker-compose setup mounts the same volume as the harness state dir, so
    *   the base is {@link SandboxConfig.stateDir}. It is undefined when the
@@ -338,8 +338,8 @@ export class DockerSandbox {
    * A host path inside the mounted directory ({@link dataMount}) maps one to
    * one. A path outside it maps to nothing, and the caller must skip the flag
    * rather than name a file that is absent in the guest. Two examples: a store
-   * moved with `LASTLIGHT_AUTH_FILE`, and the default store under local dev,
-   * where the guest sees `$STATE_DIR/sandbox-data` but not `$STATE_DIR`.
+   * moved with `LASTLIGHT_AUTH_FILE`, and a bind mount of a subdirectory of the
+   * state dir (`$STATE_DIR/sandbox-data`), which does not hold the default store.
    *
    * The result goes into an `sh -c` command, so it passes the same charset
    * guard as the other flags and must keep the `/data/` prefix.

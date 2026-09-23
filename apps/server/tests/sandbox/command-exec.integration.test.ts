@@ -92,7 +92,7 @@ describe.skipIf(!RUN)("sandbox command execution (integration)", () => {
     setEnv("LASTLIGHT_SANDBOX_NETWORK", "default");
     setEnv("LASTLIGHT_DNS_STRICT", "8.8.8.8");
     setEnv("LASTLIGHT_DNS_OPEN", "8.8.8.8");
-    // Host-path data volume → bind-mount mode (mirrors scripts/dev-local.sh),
+    // Host-path data volume → bind-mount mode (as in scripts/dev-local.sh),
     // so the harness and the daemon see the same workspace FS.
     setEnv("SANDBOX_DATA_VOLUME", join(stateDir, "sandbox-data"));
   });

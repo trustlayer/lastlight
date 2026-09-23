@@ -141,7 +141,7 @@ The dev script is explicitly safe with your personal config:
 |---|---|
 | `~/.gitconfig` (your identity, credential helper) | ❌ skipped (`LASTLIGHT_LOCAL_DEV=1`) |
 | `./data/agent-sessions/` | ✅ project-local; shim envelope jsonls for the dashboard live here |
-| `./data/sandbox-data/` | ✅ project-local bind-mount when using `LASTLIGHT_SANDBOX=docker` |
+| `./data/` (the state dir) | ✅ bind-mounted at `/data` when using `LASTLIGHT_SANDBOX=docker`, as the production volume is |
 | `./data/lastlight.db`, `./data/sandboxes/`, `./data/logs/` | ✅ project-local state, gitignored |
 
 If you want the Docker sandbox mode locally, build the image once first:
@@ -163,7 +163,7 @@ pnpm --filter lastlight-core dev:dashboard  # dashboard only
 
 Both server scripts call `apps/server/scripts/dev-local.sh`, which:
 - Verifies the sandbox image exists when `LASTLIGHT_SANDBOX=docker`
-- Copies your `GITHUB_APP_PRIVATE_KEY_PATH` into `./data/sandbox-data/secrets/app.pem` (mode 600) so the sandbox can authenticate to GitHub
+- Creates `./data/agent-sessions/` and `./data/secrets/`, and bind-mounts `./data` at `/data` in docker-mode sandboxes, as the production volume is. A sandbox reads the GitHub App key from `/data/secrets/app.pem` and the OAuth logins from `/data/auth.json`
 - Sets `LASTLIGHT_LOCAL_DEV=1`, `STATE_DIR=./data`, `LASTLIGHT_SESSIONS_DIR=./data/agent-sessions`
 - Starts the harness with `tsx watch src/index.ts` (cwd is `apps/server/`)
 
@@ -332,7 +332,7 @@ data/
     projects/-app/*.jsonl                    # Chat sessions (one per Slack thread)
     projects/-home-agent-workspace/*.jsonl   # Sandbox-mode workflow sessions
   sandboxes/                # Cloned repos per task (gondolin or docker)
-  sandbox-data/             # Shared volume mounted into docker-mode sandboxes
+  auth.json                 # OAuth logins (lastlight oauth login); docker sandboxes read it as /data/auth.json
   logs/                     # Structured logs
   secrets/app.pem           # GitHub App PEM (mode 600) for sandbox access
 ```
@@ -453,7 +453,7 @@ Legacy `OPENCODE_*` names are still read as fallbacks for the corresponding `LAS
 | `MAX_TURNS` | No | Reserved (kept for API stability) |
 | `BOT_LOGIN` | No | Bot login name for self-event filtering (default: `last-light[bot]`) |
 | `LASTLIGHT_LOCAL_DEV` | No | Set to `1` on dev machines to skip `git config --global` writes from `git-auth.ts`. The installation token still reaches sandboxes via `GIT_TOKEN`. |
-| `SANDBOX_DATA_VOLUME` | No | Used only when `LASTLIGHT_SANDBOX=docker`. Either a Docker named volume (default: `lastlight_agent-data`) or a host path (`/`, `./`, `../`, `~`) to bind-mount as `/data` inside each sandbox. Local dev uses `./data/sandbox-data`. |
+| `SANDBOX_DATA_VOLUME` | No | Used only when `LASTLIGHT_SANDBOX=docker`. Either a Docker named volume (default: `lastlight_agent-data`) or a host path (`/`, `./`, `../`, `~`) to bind-mount as `/data` inside each sandbox. Local dev uses `./data`, the state dir. |
 
 ### OpenTelemetry export
 

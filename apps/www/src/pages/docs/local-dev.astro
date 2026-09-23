@@ -90,7 +90,7 @@ npm run dev:dashboard</code></pre>
 
 	<ul>
 		<li>When <code>LASTLIGHT_SANDBOX=docker</code>, verifies Docker is running and the sandbox image exists.</li>
-		<li>Copies your <code>GITHUB_APP_PRIVATE_KEY_PATH</code> into <code>./data/sandbox-data/secrets/app.pem</code> (mode 600) so sandboxes can authenticate to GitHub.</li>
+		<li>Creates <code>./data/agent-sessions/</code> and <code>./data/secrets/</code>, and bind-mounts <code>./data</code> at <code>/data</code> in docker-mode sandboxes, as the production volume is. A sandbox reads the GitHub App key from <code>/data/secrets/app.pem</code> and the OAuth logins from <code>/data/auth.json</code>.</li>
 		<li>
 			Sets safe defaults: <code>LASTLIGHT_LOCAL_DEV=1</code>,
 			<code>STATE_DIR=./data</code>, <code>LASTLIGHT_SESSIONS_DIR=./data/agent-sessions</code>.

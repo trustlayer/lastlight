@@ -102,8 +102,11 @@ fi
 export STATE_DIR="$STATE_DIR_LOCAL"
 export LASTLIGHT_SESSIONS_DIR="$STATE_DIR_LOCAL/agent-sessions"
 export LASTLIGHT_SANDBOX
-# Mirrors STATE_DIR for the docker-mode bind mount.
-export SANDBOX_DATA_VOLUME="$STATE_DIR_LOCAL/sandbox-data"
+# The docker-mode bind mount at /data. It is the state dir itself, as the
+# named volume is in production: the guest reads secrets/app.pem and the OAuth
+# store auth.json from it (--auth-file). The old ./data/sandbox-data subdir
+# held credentials for the Claude CLI sandbox, and nothing fills it now.
+export SANDBOX_DATA_VOLUME="$STATE_DIR_LOCAL"
 
 echo "[dev-local] STATE_DIR=$STATE_DIR"
 echo "[dev-local] LASTLIGHT_SESSIONS_DIR=$LASTLIGHT_SESSIONS_DIR"

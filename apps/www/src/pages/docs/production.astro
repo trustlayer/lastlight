@@ -189,7 +189,7 @@ curl -X POST https://lastlight.example.com/webhooks/github -d '&#123;&#125;'</co
 		<li><code>lastlight.db</code> — the SQLite state database: executions, workflow runs, approvals, cron history, users, messaging sessions, feedback signals. <em>Absent when you run on Postgres</em> — the same tables live on your server instead (next section).</li>
 		<li><code>agent-sessions/projects/</code> — JSONL session files (Claude-SDK-style envelope written by <code>event-shim.ts</code> — the full audit trail for every run, read by the dashboard). Override the location with <code>LASTLIGHT_SESSIONS_DIR</code>.</li>
 		<li><code>sandboxes/</code> — cloned repos, one per task (gondolin or docker).</li>
-		<li><code>sandbox-data/</code> — shared volume mounted into docker-mode sandboxes.</li>
+		<li><code>auth.json</code> — OAuth subscription logins (<code>lastlight oauth login</code>). Docker-mode sandboxes mount this directory at <code>/data</code> and read the file as <code>/data/auth.json</code>.</li>
 		<li><code>logs/</code> — structured harness logs.</li>
 		<li><code>secrets/app.pem</code> — mode-600 copy of the GitHub App key, used by sandbox containers via the shared volume.</li>
 	</ul>
