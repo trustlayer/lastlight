@@ -1,8 +1,9 @@
 /**
  * `lastlight-shared` — the light modules shared by the published `lastlight`
  * CLI and `lastlight-core`. Node built-ins + `yaml` / `@clack/prompts` /
- * `chalk` / `@earendil-works/pi-ai` (oauth subpath) / `lastlight-workflow-engine`
- * (workflow schema) only — no heavy runtime deps (drizzle/libsql, slack,
+ * `chalk` / `@earendil-works/pi-ai` (oauth subpath) / `proper-lockfile` (the
+ * oauth store lock) / `lastlight-workflow-engine` (workflow schema) only — no
+ * heavy runtime deps (drizzle/libsql, slack,
  * octokit, hono, otel, agentic-pi) are ever reachable from here (fence F4).
  *
  * Invariant: no edge from `shared` back to `lastlight-core`.

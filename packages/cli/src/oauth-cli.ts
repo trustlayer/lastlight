@@ -21,8 +21,7 @@ import {
   loadAuthMap,
   resolveAuthFile,
   resolveOAuthApiKey,
-  saveAuthMap,
-  type AuthMap,
+  updateAuthMap,
 } from "lastlight-shared";
 
 interface OAuthCliOpts {
@@ -158,9 +157,13 @@ async function oauthLogin(providerId: string | undefined, opts: OAuthCliOpts): P
       onProgress: (msg) => console.log(chalk.dim(msg)),
     });
 
-    const map: AuthMap = loadAuthMap(opts.authFile, opts.stateDir);
-    map[provider.id] = { type: "oauth", ...credentials };
-    saveAuthMap(map, opts.authFile, opts.stateDir);
+    // Under the store lock: a harness or a sandbox can rotate another
+    // provider's token while the login waits for the user.
+    await updateAuthMap(
+      (map) => ({ result: undefined, next: { ...map, [provider.id]: { type: "oauth", ...credentials } } }),
+      opts.authFile,
+      opts.stateDir,
+    );
     console.log(chalk.green(`\n✓ Logged in to ${provider.name}.`));
     console.log(chalk.dim(`  Credentials saved to ${fileFor(opts)}`));
     console.log(
@@ -189,19 +192,28 @@ function sampleModelFor(id: string): string {
 }
 
 async function oauthLogout(providerId: string | undefined, opts: OAuthCliOpts): Promise<void> {
-  const map = loadAuthMap(opts.authFile, opts.stateDir);
   if (!providerId) {
-    const n = Object.keys(map).length;
-    saveAuthMap({}, opts.authFile, opts.stateDir);
+    const n = await updateAuthMap(
+      (map) => ({ result: Object.keys(map).length, next: {} }),
+      opts.authFile,
+      opts.stateDir,
+    );
     console.log(chalk.green(`✓ Cleared all ${n} OAuth login(s) from ${fileFor(opts)}`));
     return;
   }
-  if (!map[providerId]) {
+  // Check without the lock first, so that a logout with no store creates none.
+  if (!loadAuthMap(opts.authFile, opts.stateDir)[providerId]) {
     console.log(chalk.yellow(`No stored login for '${providerId}'.`));
     return;
   }
-  delete map[providerId];
-  saveAuthMap(map, opts.authFile, opts.stateDir);
+  await updateAuthMap(
+    (map) => {
+      const { [providerId]: _removed, ...rest } = map;
+      return { result: undefined, next: rest };
+    },
+    opts.authFile,
+    opts.stateDir,
+  );
   console.log(chalk.green(`✓ Logged out of '${providerId}'.`));
 }
 

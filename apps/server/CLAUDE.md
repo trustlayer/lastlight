@@ -55,7 +55,10 @@ providers authenticate by subscription login instead of a static key —
 `packages/shared/src/providers.ts` (separate from the API-key `PROVIDERS`). `src/engine/oauth.ts` is the shared
 layer: one on-disk store (`$STATE_DIR/auth.json`, override `LASTLIGHT_AUTH_FILE`
 — same JSON shape pi-ai's own CLI writes), `resolveOAuthApiKey()`
-(refresh-if-expired + persist), and the model-prefix→provider-id map.
+(refresh-if-expired + persist), and the model-prefix→provider-id map. Every
+write goes through `updateAuthMap()`, under the same proper-lockfile lock that
+pi takes (`auth.json.lock`), because the harness, the CLI and pi (in-process or
+in a docker guest) all write the store. Do not add a write that bypasses it.
 `lastlight oauth login|list|status|test|logout` (host-local,
 `packages/cli/src/oauth-cli.ts`) drives the browser flow. **Two seams, different reach:**
 the in-process **chat** path (`chat-runner.ts`) passes the token as a per-call
