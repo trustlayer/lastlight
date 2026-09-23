@@ -76,11 +76,14 @@ describe("oauth: sandbox env-var route", () => {
     expect(oauthEnvVarForProvider("openai-codex")).toBeUndefined();
   });
 
-  it("declares the egress hosts the API-key registry does not already cover", () => {
-    expect(oauthProviderById("openai-codex")?.hosts).toEqual(["chatgpt.com"]);
+  it("declares its own model and token refresh hosts, independent of the API-key registry", () => {
+    // A `providers:` override can move a host of the API-key registry, so the
+    // refresh hosts are declared here: auth.openai.com (Codex) and
+    // platform.claude.com (Anthropic). Copilot refreshes on github.com, which
+    // the fixed GitHub group of the allowlist covers.
+    expect(oauthProviderById("openai-codex")?.hosts).toEqual(["chatgpt.com", "auth.openai.com"]);
     expect(oauthProviderById("github-copilot")?.hosts).toEqual(["githubcopilot.com"]);
-    // anthropic.com is already an API-key provider host, so nothing is declared.
-    expect(oauthProviderById("anthropic")?.hosts).toBeUndefined();
+    expect(oauthProviderById("anthropic")?.hosts).toEqual(["platform.claude.com"]);
   });
 });
 

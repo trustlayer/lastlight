@@ -74,9 +74,10 @@ export const GITHUB_HOSTS: readonly string[] = [
  *
  * The OAuth (subscription-login) providers are merged in on top. They carry no
  * `host` field in the registry, because they have no API-key entry there, so
- * each one declares its own `hosts` in `packages/shared/src/providers.ts`. A
- * host an API-key provider already covers is declared nowhere and deduped here
- * anyway.
+ * each one declares its own `hosts` in `packages/shared/src/providers.ts`,
+ * token refresh hosts included. They do not rely on an API-key host, because a
+ * `providers:` override can move that host. A host that is in both lists is
+ * deduped here.
  */
 export function providerHosts(): readonly string[] {
   const hosts = [...providerRegistry().hosts];

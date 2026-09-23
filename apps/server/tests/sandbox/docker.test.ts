@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { afterEach, describe, it, expect, vi, beforeEach } from "vitest";
 import { EventEmitter } from "events";
 
 vi.mock("child_process", async (importOriginal) => {
@@ -205,18 +205,28 @@ describe("DockerSandbox.runAgent — prompt via stdin, not shell arg", () => {
   });
 });
 
-// The harness state dir is mounted at /data, so the OAuth credential store the
-// orchestrator names on the host is readable in the guest. The driver maps the
-// path and passes `--auth-file` — the only auth route for a provider with no
-// env var (Codex).
+// In production the harness state dir is mounted at /data, so the OAuth
+// credential store the orchestrator names on the host is readable in the guest.
+// The driver maps the path and passes `--auth-file` — the only auth route for a
+// provider with no env var (Codex).
 describe("DockerSandbox.runAgent — OAuth credential store via the /data mount", () => {
   const RUN = { timeoutSeconds: 5, gateTimeoutSeconds: 900 };
   const STATE_DIR = "/app/data";
+  const OUTSIDE_MOUNT = "outside the directory mounted at /data";
   let manager: DockerSandbox;
   let fakeChild: ReturnType<typeof makeFakeChild>;
+  const prevDataVolume = process.env.SANDBOX_DATA_VOLUME;
+
+  afterEach(() => {
+    if (prevDataVolume === undefined) delete process.env.SANDBOX_DATA_VOLUME;
+    else process.env.SANDBOX_DATA_VOLUME = prevDataVolume;
+  });
 
   beforeEach(() => {
     vi.clearAllMocks();
+    // The default is the production named volume. Each test that needs a
+    // different mount sets the variable itself.
+    delete process.env.SANDBOX_DATA_VOLUME;
     fakeChild = makeFakeChild();
     mockSpawn.mockReturnValue(fakeChild as unknown as ReturnType<typeof spawn>);
     manager = new DockerSandbox({ imageName: "test-image", env: {}, stateDir: STATE_DIR });
@@ -238,7 +248,7 @@ describe("DockerSandbox.runAgent — OAuth credential store via the /data mount"
   it("maps the default store to the in-guest path", async () => {
     const shCmd = await runWith(`${STATE_DIR}/auth.json`);
     expect(shCmd).toContain("--auth-file /data/auth.json");
-    expect(warnSpy.mock.calls.some(([m]) => String(m).includes("outside the mounted state dir"))).toBe(false);
+    expect(warnSpy.mock.calls.some(([m]) => String(m).includes(OUTSIDE_MOUNT))).toBe(false);
   });
 
   it("maps a store in a subdirectory of the state dir", async () => {
@@ -249,7 +259,7 @@ describe("DockerSandbox.runAgent — OAuth credential store via the /data mount"
   it("passes no flag when the run carries no auth file", async () => {
     const shCmd = await runWith(undefined);
     expect(shCmd).not.toContain("--auth-file");
-    expect(warnSpy.mock.calls.some(([m]) => String(m).includes("outside the mounted state dir"))).toBe(false);
+    expect(warnSpy.mock.calls.some(([m]) => String(m).includes(OUTSIDE_MOUNT))).toBe(false);
   });
 
   it("passes no flag and warns for a store outside the state dir", async () => {
@@ -257,7 +267,7 @@ describe("DockerSandbox.runAgent — OAuth credential store via the /data mount"
     // on the host but no mount carries it into the guest.
     const shCmd = await runWith("/elsewhere/auth.json");
     expect(shCmd).not.toContain("--auth-file");
-    expect(warnSpy.mock.calls.some(([m]) => String(m).includes("outside the mounted state dir"))).toBe(true);
+    expect(warnSpy.mock.calls.some(([m]) => String(m).includes(OUTSIDE_MOUNT))).toBe(true);
   });
 
   it("passes no flag and warns when the driver knows no state dir", async () => {
@@ -271,6 +281,70 @@ describe("DockerSandbox.runAgent — OAuth credential store via the /data mount"
     const shCmd = await runWith(`${STATE_DIR}/auth.json`);
     expect(shCmd).not.toContain("--auth-file");
     expect(warnSpy).toHaveBeenCalled();
+  });
+
+  it("maps against the state dir for an explicit named volume (production)", async () => {
+    process.env.SANDBOX_DATA_VOLUME = "lastlight_agent-data";
+    const shCmd = await runWith(`${STATE_DIR}/auth.json`);
+    expect(shCmd).toContain("--auth-file /data/auth.json");
+  });
+
+  describe("bind mount of a host path (local dev)", () => {
+    // What `scripts/dev-local.sh` sets: the guest sees only a subdirectory of
+    // the state dir.
+    const DEV_STATE_DIR = "/home/dev/lastlight/state";
+    const DEV_DATA = `${DEV_STATE_DIR}/sandbox-data`;
+
+    beforeEach(() => {
+      process.env.SANDBOX_DATA_VOLUME = DEV_DATA;
+      manager = new DockerSandbox({ imageName: "test-image", env: {}, stateDir: DEV_STATE_DIR });
+      (manager as unknown as { activeContainers: Map<string, unknown> })
+        .activeContainers.set("task-001", {
+          containerId: "abc123",
+          containerName: "test-container",
+          worktreePath: "/tmp/work",
+        });
+    });
+
+    it("passes no flag and warns for the default store, which the mount does not carry", async () => {
+      // Before the fix the driver translated against the state dir and passed
+      // /data/auth.json — in the guest that is sandbox-data/auth.json, a file
+      // that does not exist.
+      const shCmd = await runWith(`${DEV_STATE_DIR}/auth.json`);
+      expect(shCmd).not.toContain("--auth-file");
+      expect(warnSpy.mock.calls.some(([m]) => String(m).includes(OUTSIDE_MOUNT))).toBe(true);
+    });
+
+    it("maps a store inside the mounted directory", async () => {
+      const shCmd = await runWith(`${DEV_DATA}/auth.json`);
+      expect(shCmd).toContain("--auth-file /data/auth.json");
+      expect(warnSpy.mock.calls.some(([m]) => String(m).includes(OUTSIDE_MOUNT))).toBe(false);
+    });
+
+    it("maps against the bind mount even when the driver knows no state dir", async () => {
+      manager = new DockerSandbox({ imageName: "test-image", env: {} });
+      (manager as unknown as { activeContainers: Map<string, unknown> })
+        .activeContainers.set("task-001", {
+          containerId: "abc123",
+          containerName: "test-container",
+          worktreePath: "/tmp/work",
+        });
+      const shCmd = await runWith(`${DEV_DATA}/creds/auth.json`);
+      expect(shCmd).toContain("--auth-file /data/creds/auth.json");
+    });
+
+    it("mounts at /data the same directory that the translation uses", async () => {
+      mockExecFileSync.mockReturnValue("container-xyz\n");
+      await manager.create({
+        taskId: "t",
+        worktreePath: "/tmp/work",
+        workspaceMount: { type: "bind", hostPath: "/tmp/work" },
+      });
+      const run = mockExecFileSync.mock.calls.find(
+        (c) => Array.isArray(c[1]) && (c[1] as string[])[0] === "run",
+      );
+      expect(run?.[1] as string[]).toContain(`${DEV_DATA}:/data`);
+    });
   });
 });
 

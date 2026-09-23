@@ -177,10 +177,10 @@ export interface RunAgentOpts {
    * Copilot). Always a HOST path.
    *
    * The in-process adapter (none/gondolin) runs the model call host-side and
-   * uses it as it stands. The docker adapter mounts the harness state dir at
-   * /data, so it maps the path into the guest and passes `--auth-file`. The
-   * other container adapters mount no store and ignore it; they rely on the
-   * OAuth env tokens the executor injects.
+   * uses it as it stands. The docker adapter maps the path into the guest and
+   * passes `--auth-file` when the store is inside the directory it mounts at
+   * /data (the state dir in production). The other container adapters mount no
+   * store and ignore it; they rely on the OAuth env tokens the executor injects.
    */
   authFile?: string;
   /**

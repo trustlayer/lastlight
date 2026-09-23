@@ -1,4 +1,5 @@
-import { describe, it, expect } from "vitest";
+import { afterEach, describe, it, expect } from "vitest";
+import { installProviderOverrides, resetProviderRegistry } from "#src/config/provider-registry.js";
 import {
   ALLOW_ALL_SENTINEL,
   defaultAllowlist,
@@ -34,6 +35,9 @@ describe("egress-allowlist source of truth", () => {
     // Codex model call goes to chatgpt.com, Copilot's to api.githubcopilot.com.
     expect(providerHosts()).toContain("chatgpt.com");
     expect(providerHosts()).toContain("githubcopilot.com");
+    // OAuth token refresh hosts, declared by the OAuth providers themselves.
+    expect(providerHosts()).toContain("auth.openai.com");
+    expect(providerHosts()).toContain("platform.claude.com");
     // npm — covers registry.npmjs.org, auth.npmjs.org, www.npmjs.org.
     expect(PACKAGE_REGISTRY_HOSTS).toContain("npmjs.org");
   });
@@ -79,5 +83,38 @@ describe("egress-allowlist source of truth", () => {
     ]) {
       expect(normalizeAllowlistHost(host), host).toBeNull();
     }
+  });
+});
+
+// A `providers:` override replaces the host of the API-key entry with the
+// hostname of its `baseUrl` (issue #373). The OAuth refresh hosts must not
+// depend on that entry, or an override removes them from the allowlist.
+describe("egress-allowlist with a providers: override", () => {
+  afterEach(() => resetProviderRegistry());
+
+  it("keeps the Codex token refresh host when providers.openai.baseUrl moves the openai host", () => {
+    // The standard OpenAI URL is sufficient: the override narrows openai.com to
+    // api.openai.com, which does not match auth.openai.com.
+    installProviderOverrides({ openai: { baseUrl: "https://api.openai.com/v1" } });
+    const hosts = providerHosts();
+    expect(hosts).not.toContain("openai.com");
+    expect(hosts).toContain("api.openai.com");
+    expect(hosts).toContain("chatgpt.com");
+    expect(hosts).toContain("auth.openai.com");
+  });
+
+  it("keeps the Anthropic token refresh host when providers.anthropic.baseUrl points to a gateway", () => {
+    installProviderOverrides({ anthropic: { baseUrl: "https://llm-gateway.example.com/anthropic" } });
+    const hosts = providerHosts();
+    expect(hosts).not.toContain("anthropic.com");
+    expect(hosts).toContain("llm-gateway.example.com");
+    expect(hosts).toContain("platform.claude.com");
+  });
+
+  it("puts the OAuth refresh hosts in the generated allowlist", () => {
+    installProviderOverrides({ openai: { baseUrl: "https://api.openai.com/v1" } });
+    const allowlist = mergeAllowlist(defaultAllowlist());
+    expect(allowlist).toContain("auth.openai.com");
+    expect(allowlist).toContain("platform.claude.com");
   });
 });

@@ -63,10 +63,13 @@ the in-process **chat** path (`chat-runner.ts`) passes the token as a per-call
 The **in-process backends** (`gondolin` — the default — and `none`) run the
 model call host-side, so the orchestrator hands agentic-pi `authFile` and pi's
 AuthStorage resolves **every** OAuth provider from it, Codex included. The
-**`docker` backend** runs the call in-guest, but it mounts the harness state dir
-at `/data`, so the same store is readable as `/data/auth.json`: the orchestrator
-passes the host path and `src/sandbox/docker.ts` maps it to the in-guest path
-and appends `--auth-file`. Codex therefore runs there too. The remaining
+**`docker` backend** runs the call in-guest, but in production it mounts the
+harness state dir at `/data`, so the same store is readable as `/data/auth.json`:
+the orchestrator passes the host path and `src/sandbox/docker.ts` maps it to the
+in-guest path and appends `--auth-file`. Codex therefore runs there too. The map
+follows the real mount: under `scripts/dev-local.sh` the guest sees only
+`$STATE_DIR/sandbox-data`, so the default store is not visible and the driver
+warns instead of passing a wrong path. The remaining
 **container backends** (`smol`) mount no store, so `agent-executor.ts` injects
 `ANTHROPIC_OAUTH_TOKEN` / `COPILOT_GITHUB_TOKEN` instead — and Codex has no
 in-guest env route, so it cannot authenticate *there* (the executor warns and

@@ -654,10 +654,12 @@ export interface OAuthProviderSpec {
    */
   readonly sandboxEnvVar: string | null;
   /**
-   * Hosts the in-guest model call needs, for the sandbox egress allowlist.
-   * List a host only when the API-key registry above does not already carry it:
-   * `anthropic` reuses the `anthropic.com` entry, so it declares nothing.
-   * Each entry matches the apex and all subdomains.
+   * Hosts the in-guest model call and token refresh need, for the sandbox
+   * egress allowlist. Each entry matches the apex and all subdomains.
+   *
+   * Do not rely on a host of the API-key registry above. A `providers:`
+   * override replaces the `host` of that entry with the hostname of its
+   * `baseUrl` (issue #373), so the allowlist then loses the old host.
    */
   readonly hosts?: readonly string[];
   /** True when login is mandatory (no API-key fallback). */
@@ -674,8 +676,10 @@ export const OAUTH_PROVIDERS: readonly OAuthProviderSpec[] = [
     // carries it instead: host path in-process, `/data/auth.json` on docker.
     sandboxEnvVar: null,
     // The model call goes to chatgpt.com/backend-api; the token refresh goes to
-    // auth.openai.com, which the API-key `openai` entry (openai.com) covers.
-    hosts: ["chatgpt.com"],
+    // auth.openai.com. Declare both. The API-key `openai` entry covers
+    // openai.com only while `providers.openai` has no `baseUrl`: an override
+    // replaces that host with the hostname of the new URL (issue #373).
+    hosts: ["chatgpt.com", "auth.openai.com"],
     oauthOnly: true,
   },
   {
@@ -684,6 +688,9 @@ export const OAUTH_PROVIDERS: readonly OAuthProviderSpec[] = [
     modelPrefix: "anthropic",
     sampleModel: "anthropic/claude-sonnet-4-6",
     sandboxEnvVar: "ANTHROPIC_OAUTH_TOKEN",
+    // The token refresh goes to platform.claude.com. The model call uses the
+    // base URL of the API-key `anthropic` entry, so it needs no host here.
+    hosts: ["platform.claude.com"],
     oauthOnly: false, // falls back to ANTHROPIC_API_KEY
   },
   {
