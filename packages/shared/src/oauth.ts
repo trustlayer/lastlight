@@ -14,13 +14,18 @@
  *   - the model-prefix → provider-id map and the sandbox env-var route so the
  *     chat and sandbox executors can both find the right credential.
  *
- * Two consumption seams with different reach:
+ * Two consumption seams, and the sandbox seam has three routes:
  *   - **chat** (in-process pi-ai) — passes `apiKey` in the stream options, so
  *     ALL three OAuth providers work, Codex included.
- *   - **sandbox** (agentic-pi) — has no apiKey option; it reads provider creds
- *     from env only. pi-ai honours `ANTHROPIC_OAUTH_TOKEN` and
- *     `COPILOT_GITHUB_TOKEN`, but Codex (chatgpt.com backend) has no env route,
- *     so a Codex model cannot run in the sandbox. See `oauthEnvVarForProvider`.
+ *   - **sandbox** (agentic-pi) — has no apiKey option. It reads the credential
+ *     store through `--auth-file`, or a provider token from the environment:
+ *       1. in-process backends (`gondolin`, `none`) get the host store path,
+ *       2. the `docker` backend gets the same store as `/data/auth.json`,
+ *          because the harness state dir is mounted there,
+ *       3. a container backend that mounts no store (`smol`) needs the env var
+ *          from `oauthEnvVarForProvider` — `ANTHROPIC_OAUTH_TOKEN` or
+ *          `COPILOT_GITHUB_TOKEN`. Codex has no env var, so only route 1 and
+ *          route 2 carry it.
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
@@ -54,8 +59,10 @@ export function oauthProviderIdForModel(spec: string): string | undefined {
 
 /**
  * The env var pi-ai reads inside a sandbox for a provider's OAuth token, when
- * one exists. Returns undefined for providers with no env-var route (Codex),
- * which therefore cannot authenticate in the agentic-pi sandbox.
+ * one exists. Returns undefined for providers with no env-var route (Codex).
+ * Such a provider still authenticates wherever the credential store reaches:
+ * the in-process backends and `docker`. It fails only on a container backend
+ * that mounts no store (`smol`).
  */
 export function oauthEnvVarForProvider(id: string): string | undefined {
   return oauthProviderById(id)?.sandboxEnvVar ?? undefined;

@@ -230,11 +230,13 @@ after switching `LASTLIGHT_MODEL`.
 
 **Reach differs by execution path.** The in-process **chat** path passes the
 token as a per-call key, so all three providers work there. The **sandbox**
-(agentic-pi workflow phases) resolves credentials from env only —
+(agentic-pi workflow phases) reads the credential store on `gondolin`, `none`
+and `docker` — the docker sandbox sees the same store as `/data/auth.json`
+through its data-volume mount — so all three providers run workflows on those
+backends, Codex included. The `smol` backend reads credentials from env only:
 `ANTHROPIC_OAUTH_TOKEN` / `COPILOT_GITHUB_TOKEN` cover Anthropic and Copilot,
-but **Codex has no env-token route and therefore can't run sandbox workflows**
-(it's chat-only). Use an API-key provider for build/triage/review workflows if
-you only have a Codex subscription.
+and **Codex has no env-token route, so it cannot run workflows there**. Use
+another backend or an API-key provider in that case.
 
 ---
 

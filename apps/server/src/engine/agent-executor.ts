@@ -258,28 +258,39 @@ async function prepareRun(
   if (endpointOverrides) ghEnv[PROVIDER_OVERRIDES_ENV] = JSON.stringify(endpointOverrides);
 
   // OAuth-backed providers (subscription logins: Codex / Claude Pro / Copilot).
+  // Three routes carry a credential to the model call:
   //
-  // In-process backends (none/gondolin) run the model call host-side, so the
-  // orchestrator hands agentic-pi `authFile` = our credential store and Pi's
-  // AuthStorage resolves EVERY OAuth provider (Codex included) from it. Nothing
-  // to do here for those backends.
-  //
-  // Container backends (docker/smol) run the model call inside the guest, where
-  // that host path can't be read — so we inject the refreshed token via the env
-  // var pi reads in-guest (ANTHROPIC_OAUTH_TOKEN / COPILOT_GITHUB_TOKEN). Codex
-  // has no in-guest env route (chatgpt.com backend), so it can't authenticate
-  // there — warn rather than 401 mid-run, and point at a host-side backend.
+  //   1. In-process (none/gondolin) — the call runs host-side, so the
+  //      orchestrator hands agentic-pi `authFile` = the host path of our
+  //      credential store. Pi's AuthStorage resolves EVERY OAuth provider
+  //      (Codex included) from it. Nothing to do here.
+  //   2. Docker — the call runs in-guest, but the harness state dir is mounted
+  //      at /data, so the same store is readable as /data/auth.json. The
+  //      orchestrator passes the host path and the docker driver maps it. Again
+  //      nothing to do here, and no warning: Codex works on this backend.
+  //   3. Env var — a container backend that mounts no store (smol) reads only
+  //      the environment, so we inject the refreshed token through the var pi
+  //      reads in-guest (ANTHROPIC_OAUTH_TOKEN / COPILOT_GITHUB_TOKEN). Codex
+  //      has no such var (chatgpt.com backend), so it cannot authenticate there
+  //      — warn rather than 401 mid-run, and point at a backend that can.
   const inProcessBackend = backend === "none" || backend === "gondolin";
+  // Container backends that mount the harness state dir at /data, so route 2
+  // covers them. Keep in step with the adapters in `src/sandbox/`.
+  const storeMountedBackend = backend === "docker";
   const modelSpec = config.model || DEFAULT_MODEL;
   const oauthId = oauthProviderIdForModel(modelSpec);
   if (oauthId && !inProcessBackend) {
     const oauthEnvVar = oauthEnvVarForProvider(oauthId);
     if (!oauthEnvVar) {
-      log.warn(
-        "Model uses OAuth provider with no in-guest env route — sandbox backend can't authenticate " +
-          "it; use gondolin/none (host-side auth via the credential store) or an API-key provider",
-        { modelSpec, oauthId, backend },
-      );
+      // Silent on docker: the credential store reaches the guest through /data.
+      if (!storeMountedBackend) {
+        log.warn(
+          "Model uses OAuth provider with no in-guest env route — this sandbox backend can't " +
+            "authenticate it; use docker, gondolin or none (credential-store auth), or an " +
+            "API-key provider",
+          { modelSpec, oauthId, backend },
+        );
+      }
     } else if (!ghEnv[oauthEnvVar] && !process.env[oauthEnvVar]) {
       // Only mint from stored creds when an explicit token isn't already set.
       try {

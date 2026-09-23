@@ -78,6 +78,15 @@ export interface SandboxConfig {
    * honours HTTP_PROXY / HTTPS_PROXY.
    */
   dnsIp?: string;
+  /**
+   * The harness state dir — the host side of the `/data` mount below.
+   *
+   * `runAgent` needs it to translate a host path the orchestrator passes (the
+   * OAuth credential store) into the in-guest path under {@link DATA_DIR}. The
+   * driver owns that mount, so it owns the translation too. Omit it and the
+   * translation is skipped.
+   */
+  stateDir?: string;
 }
 
 export interface SandboxInfo {
@@ -107,6 +116,8 @@ export type WorkspaceMount =
 const WORKSPACE_DIR = "/home/agent/workspace";
 /** Shared package-manager download cache mount (issue #107). */
 const PKG_CACHE_DIR = "/cache";
+/** In-guest mount point of the shared data volume — see `create()` below. */
+const DATA_DIR = "/data";
 
 export class DockerSandbox {
   private config: SandboxConfig;
@@ -152,7 +163,7 @@ export class DockerSandbox {
     // empty docker-auto-created bind target on the host filesystem (the
     // bug that made staged skills invisible — the two paths look identical
     // but live in different physical locations).
-    const dockerArgs: string[] = ["-v", `${dataMount}:/data`];
+    const dockerArgs: string[] = ["-v", `${dataMount}:${DATA_DIR}`];
     if (opts.workspaceMount.type === "bind") {
       dockerArgs.push("-v", `${opts.workspaceMount.hostPath}:${WORKSPACE_DIR}`);
     } else {
@@ -300,6 +311,28 @@ export class DockerSandbox {
   }
 
   /**
+   * Translate a host path into the path the guest sees under {@link DATA_DIR},
+   * or null when the guest cannot see that path at all.
+   *
+   * `create()` mounts the harness state dir at {@link DATA_DIR}, so a host path
+   * inside the state dir maps one to one. A path outside it (for example a
+   * store moved with `LASTLIGHT_AUTH_FILE`) maps to nothing, and the caller
+   * must skip the flag rather than name a file that is absent in the guest.
+   *
+   * The result goes into an `sh -c` command, so it passes the same charset
+   * guard as the other flags and must keep the `/data/` prefix.
+   */
+  private guestDataPath(hostPath: string): string | null {
+    const stateDir = this.config.stateDir;
+    if (!stateDir) return null;
+    const rel = relative(resolve(stateDir), resolve(hostPath));
+    if (!rel || isAbsolute(rel) || rel.split(/[\\/]/).includes("..")) return null;
+    const guestPath = `${DATA_DIR}/${rel}`;
+    if (!guestPath.startsWith(`${DATA_DIR}/`) || !/^[A-Za-z0-9/_.-]+$/.test(guestPath)) return null;
+    return guestPath;
+  }
+
+  /**
    * Run the agentic-pi CLI inside the sandbox with a prompt.
    *
    * Streams stdout line-by-line so the caller can react to JSON events
@@ -358,6 +391,15 @@ export class DockerSandbox {
        * Charset/prefix-asserted before shell interpolation.
        */
       skillDirs?: string[];
+      /**
+       * Host path of the OAuth credential store (`auth.json`). The driver
+       * translates it into the in-guest path under {@link DATA_DIR} and passes
+       * it as `--auth-file`, so pi resolves every OAuth provider in-guest —
+       * Codex included, which has no env-var route. Needs
+       * {@link SandboxConfig.stateDir}; a store outside that dir is not visible
+       * in the guest, so the flag is skipped and a warning is logged.
+       */
+      authFile?: string;
       /** Called for each newline-terminated stdout line as it arrives. */
       onLine?: (line: string) => void;
     },
@@ -417,6 +459,22 @@ export class DockerSandbox {
         throw new Error(`Refusing to pass skill dir "${dir}" — must live under ${WORKSPACE_DIR}`);
       }
       extraArgs.push("--skill", dir);
+    }
+    // OAuth credential store. `create()` mounts the harness state dir at
+    // /data, so the store the orchestrator names on the host is already in the
+    // guest — point pi at it with `--auth-file` instead of an env token. This
+    // is the only route for a provider with no env var (Codex).
+    if (opts?.authFile) {
+      const guestPath = this.guestDataPath(opts.authFile);
+      if (!guestPath) {
+        log.warn(
+          "Credential store is outside the mounted state dir — the sandbox cannot read it; " +
+            "unset LASTLIGHT_AUTH_FILE or move the store under the state dir",
+          { authFile: opts.authFile, stateDir: this.config.stateDir },
+        );
+      } else {
+        extraArgs.push("--auth-file", guestPath);
+      }
     }
     if (!/^[A-Za-z0-9/_.-]+$/.test(model)) {
       throw new Error(`Refusing to pass model "${model}" — bad charset`);

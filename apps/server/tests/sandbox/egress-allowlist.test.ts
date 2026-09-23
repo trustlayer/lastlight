@@ -30,6 +30,10 @@ describe("egress-allowlist source of truth", () => {
     // sandbox container.
     expect(providerHosts()).toContain("openai.com");
     expect(providerHosts()).toContain("anthropic.com");
+    // OAuth (subscription-login) providers contribute their own hosts: the
+    // Codex model call goes to chatgpt.com, Copilot's to api.githubcopilot.com.
+    expect(providerHosts()).toContain("chatgpt.com");
+    expect(providerHosts()).toContain("githubcopilot.com");
     // npm — covers registry.npmjs.org, auth.npmjs.org, www.npmjs.org.
     expect(PACKAGE_REGISTRY_HOSTS).toContain("npmjs.org");
   });

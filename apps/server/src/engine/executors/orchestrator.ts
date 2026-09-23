@@ -401,14 +401,16 @@ export async function runAgentIn(
       }
     };
 
-    // OAuth credential store for model auth. Only the in-process adapters
-    // (none/gondolin) run the model call host-side, so a host path resolves
-    // there; the docker adapter ignores authFile (its model call is
-    // in-container) and relies on the OAuth env tokens spliced in by the
-    // executor. Pass the path only when the store actually exists so pure
-    // API-key deployments never point agentic-pi at a phantom file.
+    // OAuth credential store for model auth. Three backends can read it. The
+    // in-process adapters (none/gondolin) run the model call host-side, so the
+    // host path resolves as it stands. The docker adapter mounts the harness
+    // state dir at /data, so it maps the same host path into the guest itself.
+    // The other container adapters mount no store and rely on the OAuth env
+    // tokens the executor splices in. Pass the path only when the store
+    // actually exists so pure API-key deployments never point agentic-pi at a
+    // phantom file.
     let authFile: string | undefined;
-    if (ctx.backend === "none" || ctx.backend === "gondolin") {
+    if (ctx.backend === "none" || ctx.backend === "gondolin" || ctx.backend === "docker") {
       const candidate = resolveAuthFile(undefined, ctx.stateDir);
       if (existsSync(candidate)) authFile = candidate;
     }

@@ -166,6 +166,9 @@ export async function createTaskSandbox(opts: {
     env: opts.env || {},
     memoryLimit: process.env.SANDBOX_MEMORY_LIMIT || undefined,
     dnsIp: opts.dnsIp,
+    // The host side of the container's /data mount — the driver maps host paths
+    // (the OAuth credential store) to in-guest paths with it.
+    stateDir: opts.stateDir,
   });
 
   try {

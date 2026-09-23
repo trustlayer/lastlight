@@ -23,13 +23,14 @@ vi.mock("fs", async (importOriginal) => {
 });
 
 // docker.ts now logs via the pino LoggerPort instead of console — mock the
-// logger module so the suite's stderr stays free of real pino JSON (no
-// assertions here depend on the logged content).
+// logger module so the suite's stderr stays free of real pino JSON. `warn` is
+// a hoisted spy so the credential-store tests can read what was logged.
+const { warnSpy } = vi.hoisted(() => ({ warnSpy: vi.fn() }));
 vi.mock("#src/logging/logger.js", () => {
   const noopLogger = {
     debug: vi.fn(),
     info: vi.fn(),
-    warn: vi.fn(),
+    warn: warnSpy,
     error: vi.fn(),
     fatal: vi.fn(),
     child: () => noopLogger,
@@ -201,6 +202,75 @@ describe("DockerSandbox.runAgent — prompt via stdin, not shell arg", () => {
       manager.runAgent("task-001", "test prompt", { ...RUN, profile: "admin" as any }),
     ).rejects.toThrow(/Refusing to pass profile "admin"/);
     expect(mockSpawn).not.toHaveBeenCalled();
+  });
+});
+
+// The harness state dir is mounted at /data, so the OAuth credential store the
+// orchestrator names on the host is readable in the guest. The driver maps the
+// path and passes `--auth-file` — the only auth route for a provider with no
+// env var (Codex).
+describe("DockerSandbox.runAgent — OAuth credential store via the /data mount", () => {
+  const RUN = { timeoutSeconds: 5, gateTimeoutSeconds: 900 };
+  const STATE_DIR = "/app/data";
+  let manager: DockerSandbox;
+  let fakeChild: ReturnType<typeof makeFakeChild>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    fakeChild = makeFakeChild();
+    mockSpawn.mockReturnValue(fakeChild as unknown as ReturnType<typeof spawn>);
+    manager = new DockerSandbox({ imageName: "test-image", env: {}, stateDir: STATE_DIR });
+    (manager as unknown as { activeContainers: Map<string, unknown> })
+      .activeContainers.set("task-001", {
+        containerId: "abc123",
+        containerName: "test-container",
+        worktreePath: "/tmp/work",
+      });
+  });
+
+  async function runWith(authFile?: string): Promise<string> {
+    const runPromise = manager.runAgent("task-001", "test prompt", { ...RUN, authFile });
+    process.nextTick(() => fakeChild.emit("close", 0));
+    await runPromise;
+    return (mockSpawn.mock.calls[0][1] as string[]).at(-1)!;
+  }
+
+  it("maps the default store to the in-guest path", async () => {
+    const shCmd = await runWith(`${STATE_DIR}/auth.json`);
+    expect(shCmd).toContain("--auth-file /data/auth.json");
+    expect(warnSpy.mock.calls.some(([m]) => String(m).includes("outside the mounted state dir"))).toBe(false);
+  });
+
+  it("maps a store in a subdirectory of the state dir", async () => {
+    const shCmd = await runWith(`${STATE_DIR}/creds/auth.json`);
+    expect(shCmd).toContain("--auth-file /data/creds/auth.json");
+  });
+
+  it("passes no flag when the run carries no auth file", async () => {
+    const shCmd = await runWith(undefined);
+    expect(shCmd).not.toContain("--auth-file");
+    expect(warnSpy.mock.calls.some(([m]) => String(m).includes("outside the mounted state dir"))).toBe(false);
+  });
+
+  it("passes no flag and warns for a store outside the state dir", async () => {
+    // What `LASTLIGHT_AUTH_FILE=/elsewhere/auth.json` produces: the file exists
+    // on the host but no mount carries it into the guest.
+    const shCmd = await runWith("/elsewhere/auth.json");
+    expect(shCmd).not.toContain("--auth-file");
+    expect(warnSpy.mock.calls.some(([m]) => String(m).includes("outside the mounted state dir"))).toBe(true);
+  });
+
+  it("passes no flag and warns when the driver knows no state dir", async () => {
+    manager = new DockerSandbox({ imageName: "test-image", env: {} });
+    (manager as unknown as { activeContainers: Map<string, unknown> })
+      .activeContainers.set("task-001", {
+        containerId: "abc123",
+        containerName: "test-container",
+        worktreePath: "/tmp/work",
+      });
+    const shCmd = await runWith(`${STATE_DIR}/auth.json`);
+    expect(shCmd).not.toContain("--auth-file");
+    expect(warnSpy).toHaveBeenCalled();
   });
 });
 

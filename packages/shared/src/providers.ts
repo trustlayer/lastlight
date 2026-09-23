@@ -615,18 +615,21 @@ export function providerOverridesFromEnv(env: NodeJS.ProcessEnv): ProviderOverri
  * OAuth (subscription-login) providers — the ones the API-key registry above
  * deliberately excludes. These don't authenticate with a static key env var;
  * a user logs in once (`lastlight oauth login <id>`) and pi-ai manages the
- * token. Two consumption seams with different reach:
+ * token. Every provider here works on every seam. There are three routes:
  *
- *   - **chat** (in-process pi-ai) supports ALL of these — the chat runner
- *     passes the resolved token as the per-call `apiKey`.
- *   - **sandbox** (agentic-pi) resolves creds from ENV only, so a provider is
- *     sandbox-usable ONLY if `sandboxEnvVar` is set (the env var pi-ai reads
- *     inside the sandbox). Codex has none → chat-only.
+ *   - **chat** (in-process pi-ai) — the chat runner passes the resolved token
+ *     as the per-call `apiKey`.
+ *   - **credential store** — the in-process backends (`gondolin`, `none`) get
+ *     the host store path, and the `docker` backend gets the same store through
+ *     its `/data` mount. pi resolves EVERY provider from it, Codex included.
+ *   - **env var** — a container backend that does not mount the store (`smol`)
+ *     needs `sandboxEnvVar`, so only Anthropic and Copilot run there.
  *
- * Egress note: chat is in-process (not behind the sandbox firewall), and the
- * one sandbox-capable OAuth provider whose models we ship (`anthropic`) reuses
- * the `anthropic.com` host already in the API-key registry — so no OAuth host
- * is added to the sandbox allowlist here.
+ * Egress note: chat runs in the harness process, outside the sandbox firewall,
+ * but a sandbox run calls the provider from inside the guest. `hosts` lists the
+ * hosts that call needs and that the API-key registry does not already cover.
+ * The sandbox allowlist merges them — see `providerHosts()` in
+ * `apps/server/src/sandbox/egress-allowlist.ts`.
  */
 export interface OAuthProviderSpec {
   /** pi-ai OAuth provider id — also `lastlight oauth login <id>`. */
@@ -641,14 +644,22 @@ export interface OAuthProviderSpec {
    * Env var pi-ai reads for this provider's OAuth token inside a sandbox, or
    * `null` when there's no env route.
    *
-   * `null` does NOT mean chat-only. It only bites on the **container** backends
-   * (docker / smol), where the model call happens in-guest and cannot read the
-   * host credential store. On the in-process backends (`gondolin`, the default,
-   * and `none`) the orchestrator passes agentic-pi `authFile` and pi's
-   * AuthStorage resolves every OAuth provider from it, Codex included. See the
-   * OAuth block in `apps/server/src/engine/agent-executor.ts`.
+   * `null` does NOT mean chat-only, and it no longer blocks the `docker`
+   * backend. The in-process backends (`gondolin`, the default, and `none`) get
+   * the host credential store as agentic-pi's `authFile`, and `docker` gets the
+   * same store as `/data/auth.json` through its data-volume mount. pi's
+   * AuthStorage resolves every OAuth provider from it, Codex included. Only a
+   * container backend that mounts no store (`smol`) still needs this env var.
+   * See the OAuth block in `apps/server/src/engine/agent-executor.ts`.
    */
   readonly sandboxEnvVar: string | null;
+  /**
+   * Hosts the in-guest model call needs, for the sandbox egress allowlist.
+   * List a host only when the API-key registry above does not already carry it:
+   * `anthropic` reuses the `anthropic.com` entry, so it declares nothing.
+   * Each entry matches the apex and all subdomains.
+   */
+  readonly hosts?: readonly string[];
   /** True when login is mandatory (no API-key fallback). */
   readonly oauthOnly: boolean;
 }
@@ -659,7 +670,12 @@ export const OAUTH_PROVIDERS: readonly OAuthProviderSpec[] = [
     displayName: "ChatGPT Plus/Pro (Codex)",
     modelPrefix: "openai-codex",
     sampleModel: "openai-codex/gpt-5.4",
-    sandboxEnvVar: null, // chatgpt.com backend — no env route, chat-only
+    // chatgpt.com backend — pi reads no env var for it. The credential store
+    // carries it instead: host path in-process, `/data/auth.json` on docker.
+    sandboxEnvVar: null,
+    // The model call goes to chatgpt.com/backend-api; the token refresh goes to
+    // auth.openai.com, which the API-key `openai` entry (openai.com) covers.
+    hosts: ["chatgpt.com"],
     oauthOnly: true,
   },
   {
@@ -676,6 +692,9 @@ export const OAUTH_PROVIDERS: readonly OAuthProviderSpec[] = [
     modelPrefix: "github-copilot",
     sampleModel: "github-copilot/gpt-4o",
     sandboxEnvVar: "COPILOT_GITHUB_TOKEN",
+    // The model call goes to api.githubcopilot.com; the token exchange goes to
+    // github.com, which the GitHub group of the allowlist already covers.
+    hosts: ["githubcopilot.com"],
     oauthOnly: true,
   },
 ];

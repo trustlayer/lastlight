@@ -288,8 +288,11 @@ lastlight skills uninstall             # remove them [--scope user|project]
 ## Subscription logins (`oauth-cli.ts`)
 
 Browser OAuth flow + credential store at `$STATE_DIR/auth.json` (override
-`LASTLIGHT_AUTH_FILE`); restart the agent to apply. Codex is chat-only (no sandbox
-env-token route).
+`LASTLIGHT_AUTH_FILE`); restart the agent to apply. Codex has no sandbox
+env-token route, so it runs wherever the store reaches: chat, `gondolin`,
+`none`, and `docker` (which mounts the store at `/data/auth.json`). It cannot
+run on `smol`. `LASTLIGHT_AUTH_FILE` moves the store outside the state dir, and
+the docker sandbox then cannot read it.
 
 ```bash
 lastlight oauth login [provider]       # openai-codex | anthropic | github-copilot

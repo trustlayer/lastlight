@@ -174,9 +174,13 @@ export interface RunAgentOpts {
   /**
    * Credential store (`auth.json`) agentic-pi points Pi's AuthStorage at for
    * model auth — carries OAuth subscription logins (Codex / Claude Pro /
-   * Copilot). Only meaningful for the in-process adapter (none/gondolin), where
-   * the model call runs host-side so a host path resolves; the docker adapter
-   * ignores it (its model call is in-container) and relies on env tokens.
+   * Copilot). Always a HOST path.
+   *
+   * The in-process adapter (none/gondolin) runs the model call host-side and
+   * uses it as it stands. The docker adapter mounts the harness state dir at
+   * /data, so it maps the path into the guest and passes `--auth-file`. The
+   * other container adapters mount no store and ignore it; they rely on the
+   * OAuth env tokens the executor injects.
    */
   authFile?: string;
   /**
@@ -405,6 +409,9 @@ class DockerSandbox implements Sandbox {
       skillDirs: opts.skillDirs,
       webSearch: opts.webSearch,
       webSearchProvider: opts.webSearchProvider,
+      // Host path. The driver knows the /data mount, so it maps the path into
+      // the guest and appends `--auth-file` itself.
+      authFile: opts.authFile,
       timeoutSeconds: opts.timeoutSeconds,
       gateTimeoutSeconds: opts.gateTimeoutSeconds,
       onLine: parseLine(onEvent),

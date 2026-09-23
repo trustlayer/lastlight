@@ -4,7 +4,8 @@
  * model is OAuth-backed and a login exists:
  *   - anthropic  → ANTHROPIC_OAUTH_TOKEN
  *   - copilot    → COPILOT_GITHUB_TOKEN
- *   - codex      → no env route → nothing injected (chat-only)
+ *   - codex      → no env route → nothing injected. The credential store
+ *     covers it instead on every backend but `smol`.
  *
  * We capture the env handed to the sandbox via FakeSandbox and stub
  * `resolveOAuthApiKey` so the assertion is about the wiring, not pi-ai's token
@@ -49,7 +50,7 @@ function stateDirs() {
 
 async function runWithModel(
   model: string,
-  opts: { backend?: "none" | "docker"; writeStore?: boolean } = {},
+  opts: { backend?: "none" | "docker" | "smol"; writeStore?: boolean } = {},
 ) {
   const { stateDir, sessionsDir } = stateDirs();
   if (opts.writeStore) {
@@ -96,11 +97,21 @@ describe("executor OAuth env injection (container backends)", () => {
     expect(fake.env?.COPILOT_GITHUB_TOKEN).toBe("copilot-tok");
   });
 
-  it("warns (injects nothing) for a Codex model — no in-guest env route", async () => {
+  it("injects nothing for a Codex model on docker — and does not warn", async () => {
+    // Docker mounts the harness state dir at /data, so the credential store
+    // authenticates Codex in-guest. The old "no in-guest env route" warning
+    // would be wrong there.
     const { fake } = await runWithModel("openai-codex/gpt-5.4", { backend: "docker" });
     expect(resolveOAuthApiKeySpy).not.toHaveBeenCalled();
     expect(fake.env?.ANTHROPIC_OAUTH_TOKEN).toBeUndefined();
     expect(fake.env?.COPILOT_GITHUB_TOKEN).toBeUndefined();
+    expect(warnSpy.mock.calls.some(([m]) => String(m).includes("no in-guest env route"))).toBe(false);
+  });
+
+  it("warns for a Codex model on smol — that backend mounts no store", async () => {
+    const { fake } = await runWithModel("openai-codex/gpt-5.4", { backend: "smol" });
+    expect(fake.env?.ANTHROPIC_OAUTH_TOKEN).toBeUndefined();
+    expect(warnSpy.mock.calls.some(([m]) => String(m).includes("no in-guest env route"))).toBe(true);
   });
 
   it("injects nothing for an Anthropic model with no stored login", async () => {
@@ -152,6 +163,14 @@ describe("executor OAuth via authFile (in-process backends)", () => {
     expect(resolveOAuthApiKeySpy).not.toHaveBeenCalled();
     expect(fake.env?.ANTHROPIC_OAUTH_TOKEN).toBeUndefined();
     // …instead the store path is handed to agentic-pi as authFile.
+    expect(fake.receivedAgentOpts?.authFile).toBe(join(stateDir, "auth.json"));
+  });
+
+  it("passes authFile on docker too — the /data mount carries the store in-guest", async () => {
+    const { fake, stateDir } = await runWithModel("openai-codex/gpt-5.4", {
+      backend: "docker",
+      writeStore: true,
+    });
     expect(fake.receivedAgentOpts?.authFile).toBe(join(stateDir, "auth.json"));
   });
 

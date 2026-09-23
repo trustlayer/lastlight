@@ -63,12 +63,17 @@ the in-process **chat** path (`chat-runner.ts`) passes the token as a per-call
 The **in-process backends** (`gondolin` — the default — and `none`) run the
 model call host-side, so the orchestrator hands agentic-pi `authFile` and pi's
 AuthStorage resolves **every** OAuth provider from it, Codex included. The
-**container backends** (`docker` / `smol`) run it in-guest, where that host path
-is unreadable, so `agent-executor.ts` injects `ANTHROPIC_OAUTH_TOKEN` /
-`COPILOT_GITHUB_TOKEN` instead — and Codex has no in-guest env route, so it
-cannot authenticate *there* (the executor warns and points at a host-side
-backend). Codex is **not** chat-only on a default install; it is unusable only
-on the container backends.
+**`docker` backend** runs the call in-guest, but it mounts the harness state dir
+at `/data`, so the same store is readable as `/data/auth.json`: the orchestrator
+passes the host path and `src/sandbox/docker.ts` maps it to the in-guest path
+and appends `--auth-file`. Codex therefore runs there too. The remaining
+**container backends** (`smol`) mount no store, so `agent-executor.ts` injects
+`ANTHROPIC_OAUTH_TOKEN` / `COPILOT_GITHUB_TOKEN` instead — and Codex has no
+in-guest env route, so it cannot authenticate *there* (the executor warns and
+names the backends that work). Codex is **not** chat-only.
+
+`LASTLIGHT_AUTH_FILE` can move the store outside the state dir. The docker
+driver then finds no in-guest path, skips the flag, and logs a warning.
 
 The cheap-helper path (`src/engine/llm.ts`, used by screener + classifier)
 bypasses agentic-pi and dispatches directly to the same three providers.

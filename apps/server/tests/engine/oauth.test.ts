@@ -27,7 +27,7 @@ describe("providers: OAuth registry", () => {
     ]);
   });
 
-  it("marks Codex chat-only (no sandbox env route) but the others sandbox-capable", () => {
+  it("gives Codex no sandbox env route, and the other two one each", () => {
     expect(oauthProviderById("openai-codex")?.sandboxEnvVar).toBeNull();
     expect(oauthProviderById("anthropic")?.sandboxEnvVar).toBe("ANTHROPIC_OAUTH_TOKEN");
     expect(oauthProviderById("github-copilot")?.sandboxEnvVar).toBe("COPILOT_GITHUB_TOKEN");
@@ -72,8 +72,15 @@ describe("oauth: sandbox env-var route", () => {
     expect(oauthEnvVarForProvider("github-copilot")).toBe("COPILOT_GITHUB_TOKEN");
   });
 
-  it("returns undefined for Codex (chat-only, no env route)", () => {
+  it("returns undefined for Codex (no env route — the credential store carries it)", () => {
     expect(oauthEnvVarForProvider("openai-codex")).toBeUndefined();
+  });
+
+  it("declares the egress hosts the API-key registry does not already cover", () => {
+    expect(oauthProviderById("openai-codex")?.hosts).toEqual(["chatgpt.com"]);
+    expect(oauthProviderById("github-copilot")?.hosts).toEqual(["githubcopilot.com"]);
+    // anthropic.com is already an API-key provider host, so nothing is declared.
+    expect(oauthProviderById("anthropic")?.hosts).toBeUndefined();
   });
 });
 

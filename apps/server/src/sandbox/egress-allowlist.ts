@@ -1,4 +1,5 @@
 import { isIP } from "node:net";
+import { OAUTH_PROVIDERS } from "lastlight-shared/providers";
 import { providerRegistry } from "../config/provider-registry.js";
 
 /**
@@ -70,9 +71,21 @@ export const GITHUB_HOSTS: readonly string[] = [
  * reached the host's gateway anyway; use an in-process backend (`gondolin` /
  * `none`, where the model call happens host-side), or give the gateway a
  * resolvable name.
+ *
+ * The OAuth (subscription-login) providers are merged in on top. They carry no
+ * `host` field in the registry, because they have no API-key entry there, so
+ * each one declares its own `hosts` in `packages/shared/src/providers.ts`. A
+ * host an API-key provider already covers is declared nowhere and deduped here
+ * anyway.
  */
 export function providerHosts(): readonly string[] {
-  return providerRegistry().hosts;
+  const hosts = [...providerRegistry().hosts];
+  for (const spec of OAUTH_PROVIDERS) {
+    for (const host of spec.hosts ?? []) {
+      if (!hosts.includes(host)) hosts.push(host);
+    }
+  }
+  return hosts;
 }
 
 /**

@@ -442,6 +442,48 @@ describe("Sandbox orchestrator (FakeSandbox)", () => {
     });
   });
 
+  // The credential store reaches three backends: the two in-process ones as a
+  // host path, and docker through its /data mount. The orchestrator passes the
+  // host path for all three and the docker driver maps it.
+  describe("OAuth credential store (authFile)", () => {
+    const storePath = (): string => join(stateDir, "auth.json");
+    const writeStore = (): void =>
+      writeFileSync(storePath(), JSON.stringify({ "openai-codex": { type: "oauth" } }));
+
+    async function runOn(backend: "none" | "docker" | "smol"): Promise<FakeSandbox> {
+      const fake = new FakeSandbox({ events: successEvents() });
+      await executeAgent(
+        "do the thing",
+        { sandbox: backend, stateDir, sessionsDir, model: "openai-codex/gpt-5.4" },
+        { sandboxFactory: fake.asFactory() },
+      );
+      return fake;
+    }
+
+    it("passes the store path on the docker backend", async () => {
+      writeStore();
+      const fake = await runOn("docker");
+      expect(fake.receivedAgentOpts?.authFile).toBe(storePath());
+    });
+
+    it("passes the store path on an in-process backend", async () => {
+      writeStore();
+      const fake = await runOn("none");
+      expect(fake.receivedAgentOpts?.authFile).toBe(storePath());
+    });
+
+    it("omits the path on docker when no store exists", async () => {
+      const fake = await runOn("docker");
+      expect(fake.receivedAgentOpts?.authFile).toBeUndefined();
+    });
+
+    it("omits the path on a backend that mounts no store", async () => {
+      writeStore();
+      const fake = await runOn("smol");
+      expect(fake.receivedAgentOpts?.authFile).toBeUndefined();
+    });
+  });
+
   it("skips the session jsonl when writeSession is false", async () => {
     const fake = new FakeSandbox({
       commandResult: { exitCode: 0, stdout: "ok", stderr: "", timedOut: false },
