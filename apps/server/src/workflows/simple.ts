@@ -54,6 +54,7 @@ import { K8S_SANITY_FUSE } from "./admission.js";
 import type { TemplateContext } from "./templates.js";
 import { slugify } from "./templates.js";
 import { wrapUntrusted } from "../engine/screen/screen.js";
+import { fetchSentryContext, sentryOptionsFromEnv } from "../engine/sentry-context.js";
 import { buildProgressModel, runDashboardUrl } from "../notify/model.js";
 import { buildAssetIssueKey } from "../state/build-assets.js";
 import {
@@ -1429,6 +1430,22 @@ export async function runSimpleWorkflow(
   const issueRef = `${owner}/${repo}${issueNumber ? `#${issueNumber}` : ""}`;
   const hasAnyUserContent = !!(combinedContext || request.issueBody || request.commentBody);
 
+  // An issue that the Sentry integration opened shows a short stack only. The
+  // harness fetches the Sentry issue and its latest event on the host, so the
+  // Sentry token never goes into the sandbox. The text is data from the
+  // monitored application, so it goes in an untrusted wrapper too. Empty when
+  // no token is set or the thread has no link to a Sentry issue.
+  const sentryOptions = sentryOptionsFromEnv();
+  const sentryContext = hasAnyUserContent && sentryOptions
+    ? await fetchSentryContext(
+        [combinedContext || request.issueBody || "", request.commentBody || ""].join("\n"),
+        sentryOptions,
+      ).catch((err: unknown) => {
+        simpleLog.warn("Sentry context failed", { err });
+        return "";
+      })
+    : "";
+
   const contextSnapshot = hasAnyUserContent
     ? [
         `Repo: ${issueRef}`,
@@ -1442,6 +1459,9 @@ export async function runSimpleWorkflow(
           ? `Issue body and full thread:\n${wrapUntrusted(combinedContext, { source: "github-issue-thread" })}`
           : request.issueBody
           ? `Issue body:\n${wrapUntrusted(request.issueBody, { source: "github-issue-body" })}`
+          : "",
+        sentryContext
+          ? `Sentry issue data (the harness fetched it from the Sentry API):\n${wrapUntrusted(sentryContext, { source: "sentry-api" })}`
           : "",
       ]
         .filter(Boolean)

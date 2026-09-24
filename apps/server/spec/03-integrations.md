@@ -640,6 +640,15 @@ It **dispatches** when the card lands on a stage's `enter` or `running` column, 
 
 The freshest the board gets is a function of the TTL, and the highest-value lever on that is not a shorter TTL but `invalidateBoard(repo)` — exported for a later slice to wire to the `issue.labeled` webhook, so a human moving a card sees it move.
 
+## 6. Sentry (optional, read-only context)
+
+The Sentry integration for GitHub opens an issue with a short stack trace only. When `SENTRY_AUTH_TOKEN` is set, `runSimpleWorkflow` looks for links to Sentry issues in the issue body, the thread and the triggering comment. For each link (three at most), it fetches the issue and its latest event, and adds them to `contextSnapshot` in an untrusted wrapper (`source="sentry-api"`). (`src/engine/sentry-context.ts`)
+
+- **The host fetches, the sandbox does not.** The token stays in the harness process, so an agent cannot read it or use it for other requests. The token goes only to `SENTRY_API_URL` (default `https://sentry.io`). A link selects the organization and the issue id, never the host. `SENTRY_ORGS` limits the organizations.
+- **What the agent sees.** The issue summary (count, first and last seen, status), the release and the tags, every frame of the exception with the source lines of the in-app frames, the message, the request method and URL, the last 30 breadcrumbs, the extra data and the contexts. The harness does not send the request headers, the cookies or the frame variables.
+- **A failure does not fail the run.** A link that the harness cannot fetch gives a warning in the log and one line in the context with the reason.
+- **Where it reaches.** Only the phases that see `contextSnapshot`: the prompts that include it (`guardrails`, `architect`) and each skill-only phase, which gets the full context. A resumed run has an empty `contextSnapshot`, so it does not fetch again.
+
 ## Invariants
 
 - **One handler in, one envelope out.** Every connector's `event` emitter
