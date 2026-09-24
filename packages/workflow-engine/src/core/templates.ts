@@ -210,7 +210,10 @@ export function renderTemplate(template: string, ctx: TemplateContext): string {
     const branchHref = `https://github.com/${ctx.owner}/${ctx.repo}/blob/${encodeURIComponent(ctx.branch)}/${ctx.issueDir}/${file}`;
     if (!ctx.externalizeArtifacts) return branchHref;
     if (!ctx.publicUrl) return branchHref;
-    const issueKey = ctx.issueDir.replace(/^\.lastlight\//, "");
+    // A whole-workspace backend relocates the docs to `../.lastlight/<key>`
+    // (artifactIssueDir in apps/server). Strip both prefixes: the store
+    // rejects a key that contains a `/`.
+    const issueKey = ctx.issueDir.replace(/^(?:\.\.\/)?\.lastlight\//, "");
     const base = String(ctx.publicUrl).replace(/\/+$/, "");
     const q =
       `repo=${encodeURIComponent(`${ctx.owner}/${ctx.repo}`)}` +

@@ -58,6 +58,21 @@ describe("renderTemplate — {{artifactUrl}} (build-assets mode)", () => {
     );
   });
 
+  it("server mode with the relocated issueDir → the key has no ../ prefix", () => {
+    // A whole-workspace backend (docker, kubernetes) moves the docs out of the
+    // checkout to `../.lastlight/<key>` (see artifactIssueDir). The store key
+    // is still `issue-42`: it rejects a key with a `/` with a 400.
+    const result = renderTemplate("{{artifactUrl architect-plan.md}}", {
+      ...BASE_CTX,
+      issueDir: "../.lastlight/issue-42",
+      externalizeArtifacts: true,
+      publicUrl: "https://last.example.com/",
+    });
+    expect(result).toBe(
+      "https://last.example.com/admin/?tab=repos&rtab=assets&repo=acme%2Fwidget&key=issue-42&doc=architect-plan.md",
+    );
+  });
+
   it("server mode without publicUrl → falls back to the branch URL", () => {
     const result = renderTemplate("{{artifactUrl status.md}}", {
       ...BASE_CTX,
