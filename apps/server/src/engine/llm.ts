@@ -20,11 +20,21 @@
  * Scope: this helper supports the providers listed in `src/providers.ts`.
  * Workflow phases themselves are provider-agnostic (whatever pi-ai
  * supports); only the screener/classifier path is constrained here.
+ *
+ * An OAuth login (`lastlight oauth login <id>`) is the third route. When the
+ * model's provider has a stored login, pi-ai makes the call, as in the chat
+ * runner. The subscription endpoints (Codex on chatgpt.com, Claude Pro/Max,
+ * Copilot) have their own request shapes and headers, and the two builders
+ * below do not know them.
  */
 
+import { completeSimple } from "@earendil-works/pi-ai/compat";
+import type { Context } from "@earendil-works/pi-ai";
 import type { ApiType, ProviderSpec } from "lastlight-shared/providers";
 import { getRuntimeConfig } from "../config/config.js";
 import { providerRegistry } from "../config/provider-registry.js";
+import { resolveModel, textMessage } from "./chat/chat-runner.js";
+import { OAUTH_ONLY_PROVIDERS, oauthProviderIdForModel, resolveOAuthApiKey } from "./oauth.js";
 
 export type ChatRole = "system" | "user" | "assistant";
 
@@ -140,6 +150,10 @@ export function resolveProvider(model: string): ResolvedProvider {
  *
  * Note: only an EXPLICIT per-task entry counts — never `models.default` — so the
  * cheap helpers stay cheap unless a deployment deliberately pins them.
+ *
+ * A deployment with only OAuth logins must set `models.classifier` and
+ * `models.screener` (and `models.digest`) to a model of a logged-in provider.
+ * Step 3 looks only at API keys.
  */
 export function defaultFastModel(taskType?: string): string {
   if (taskType) {
@@ -309,6 +323,18 @@ export async function chat(
   messages: ChatMessage[],
   opts: ChatOptions = {},
 ): Promise<string> {
+  // A stored OAuth login wins over an API key, as in the chat runner. Without
+  // a login, an OAuth-only provider fails here, and Anthropic continues to the
+  // API-key path below.
+  const oauthId = oauthProviderIdForModel(model);
+  if (oauthId) {
+    const oauth = await resolveOAuthApiKey(oauthId, undefined, getRuntimeConfig()?.stateDir);
+    if (oauth) return chatWithOAuth(model, messages, opts, oauth.apiKey);
+    if (OAUTH_ONLY_PROVIDERS.has(oauthId)) {
+      throw new Error(`${model} needs an OAuth login. Run: lastlight oauth login ${oauthId}`);
+    }
+  }
+
   const { provider, modelId, api } = resolveProvider(model);
   const registry = providerRegistry();
   const spec = registry.byPrefix(provider);
@@ -340,6 +366,45 @@ export async function chat(
     }
     const data = await res.json();
     return extractText(resolvedSpec, data);
+  }, opts.timeoutMs ?? 30_000);
+}
+
+/**
+ * Send the call through pi-ai with an OAuth access token. pi-ai knows the
+ * request shape and the headers of each subscription endpoint.
+ */
+async function chatWithOAuth(
+  model: string,
+  messages: ChatMessage[],
+  opts: ChatOptions,
+  apiKey: string,
+): Promise<string> {
+  const piModel = resolveModel(model);
+  const system = messages
+    .filter((m) => m.role === "system")
+    .map((m) => m.content)
+    .join("\n");
+  const now = new Date().toISOString();
+  const context: Context = {
+    ...(system ? { systemPrompt: system } : {}),
+    messages: messages.filter((m) => m.role !== "system").map((m) => textMessage(m.role, m.content, now)),
+  };
+  return withRetry(async (signal) => {
+    // No `reasoning` option. Anthropic then runs without thinking. The Codex
+    // backend uses the default effort of the model, and pi-ai sends it no
+    // token cap, so `maxTokens` does not limit that call.
+    const res = await completeSimple(piModel, context, {
+      apiKey,
+      signal,
+      maxTokens: opts.maxTokens ?? 256,
+    });
+    if (res.stopReason === "error" || res.stopReason === "aborted") {
+      throw new Error(`${piModel.provider} api: ${res.errorMessage ?? res.stopReason}`);
+    }
+    return res.content
+      .filter((block) => block.type === "text")
+      .map((block) => block.text)
+      .join("");
   }, opts.timeoutMs ?? 30_000);
 }
 

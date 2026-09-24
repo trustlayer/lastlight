@@ -91,6 +91,13 @@ OpenRouter — direct routes avoid OpenRouter's per-token markup). Only an
 explicit per-task entry counts, never `models.default`, so the helpers stay
 cheap unless deliberately pinned.
 
+When the helper model's provider has a stored OAuth login, `chat()` sends the
+call through pi-ai with the token, as the chat runner does. The login wins over
+an API key. The last step of `defaultFastModel()` looks only at API keys, so a
+deployment with only OAuth logins must set `models.classifier`,
+`models.screener` and `models.digest`. Without them, the classifier fails and
+each comment goes to `chat`.
+
 Two execution surfaces:
 - **Sandbox** — `agentic-pi run --format json` invoked per workflow phase
   inside a Docker container (`src/sandbox/docker.ts`). Stream parsed to

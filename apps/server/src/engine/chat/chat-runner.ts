@@ -563,7 +563,8 @@ export function endpointApiKey(provider: string): string | undefined {
   return endpoint ? process.env[endpoint.envKey] : undefined;
 }
 
-function textMessage(role: string, content: string, timestamp: string): Message {
+/** A text-only pi-ai message. `llm.ts` also uses it. */
+export function textMessage(role: string, content: string, timestamp: string): Message {
   const ts = parseTimestamp(timestamp);
   if (role === "user") {
     const m: UserMessage = { role: "user", content, timestamp: ts };
