@@ -70,7 +70,7 @@
   },
   "dependencies": {
     "@clack/prompts": "^1.2.0",
-    "@earendil-works/pi-ai": "^0.84.3",
+    "@earendil-works/pi-ai": "^0.87.1",
     "chalk": "^6.0.0",
     "lastlight-workflow-engine": "workspace:*",
     "proper-lockfile": "^4.1.2",
