@@ -298,6 +298,12 @@ export interface LastLightConfig {
    * could RENAME it could also rename it to something nobody applies.
    */
   holdLabel: string;
+  /**
+   * The issue label filter (`issueFilter`). When `requiredLabels` is not
+   * empty, `dispatchWorkflow` starts a workflow in `workflows` on an issue only
+   * when the issue has one of the labels. See {@link getIssueFilter}.
+   */
+  issueFilter?: IssueFilterConfig;
   exploreDefaultRepo?: string;
   publicUrl?: string;
   /**
@@ -898,6 +904,48 @@ export function getHoldLabel(): string {
   return currentConfig?.holdLabel || HOLD_LABEL;
 }
 
+/**
+ * The workflows that the issue label filter governs when the config does not
+ * name them: the triage of an issue and the build of an issue.
+ */
+export const ISSUE_FILTER_WORKFLOWS = ["issue-triage", "build"];
+
+/**
+ * The `issueFilter:` block. An empty `requiredLabels` list turns the filter
+ * off, which is the packaged default.
+ */
+export interface IssueFilterConfig {
+  /** The issue must have one of these labels. Empty: no filter. */
+  requiredLabels: string[];
+  /** The workflows that the filter governs. */
+  workflows: string[];
+}
+
+/**
+ * Lenient like the other normalisers: a value that is not a list of strings
+ * falls back to the default. A missing `workflows` key gives
+ * {@link ISSUE_FILTER_WORKFLOWS}.
+ */
+export function normalizeIssueFilter(raw: unknown): IssueFilterConfig {
+  const r = isPlainObject(raw) ? raw : {};
+  const strings = (v: unknown): string[] | undefined =>
+    Array.isArray(v)
+      ? v.filter((s): s is string => typeof s === "string" && s.trim() !== "").map((s) => s.trim())
+      : undefined;
+  return {
+    requiredLabels: strings(r.requiredLabels) ?? [],
+    workflows: strings(r.workflows) ?? [...ISSUE_FILTER_WORKFLOWS],
+  };
+}
+
+/**
+ * The configured issue label filter. Read in `dispatchWorkflow` only, because
+ * every trigger path (webhook, router, cron, `/api/*`, resume) crosses it.
+ */
+export function getIssueFilter(): IssueFilterConfig {
+  return currentConfig?.issueFilter ?? normalizeIssueFilter(undefined);
+}
+
 const DEFAULT_MODEL = "anthropic/claude-sonnet-4-6";
 
 function defaultConfigPath(): string {
@@ -1162,6 +1210,7 @@ export function loadConfig(): LastLightConfig {
     approval,
     bootstrapLabel: fileCfg.bootstrapLabel,
     holdLabel: fileCfg.holdLabel,
+    issueFilter: fileCfg.issueFilter,
     exploreDefaultRepo: fileCfg.exploreDefaultRepo,
     publicUrl: resolvePublicUrl(),
     reviewPostsCheck: fileCfg.review.postsCheck,
@@ -1206,6 +1255,7 @@ function normalizeFileConfig(raw: Record<string, unknown>): {
   approval: Record<string, boolean>;
   bootstrapLabel: string;
   holdLabel: string;
+  issueFilter: IssueFilterConfig;
   exploreDefaultRepo?: string;
   review: ReviewConfig;
   autonomy: AutonomyConfig;
@@ -1318,6 +1368,7 @@ function normalizeFileConfig(raw: Record<string, unknown>): {
   // anything — a failure mode with no symptom until it matters.
   const holdLabel =
     typeof holdRaw.label === "string" && holdRaw.label.trim() ? holdRaw.label.trim() : HOLD_LABEL;
+  const issueFilter = normalizeIssueFilter(raw.issueFilter);
   const exploreDefaultRepo = typeof exploreRaw.defaultRepo === "string" ? exploreRaw.defaultRepo : undefined;
   // ── The fix / dependencies / review policy blocks (issues #251, #252) ──────
   //
@@ -1657,6 +1708,7 @@ function normalizeFileConfig(raw: Record<string, unknown>): {
     approval,
     bootstrapLabel,
     holdLabel,
+    issueFilter,
     exploreDefaultRepo,
     review,
     autonomy,

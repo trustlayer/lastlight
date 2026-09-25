@@ -3,7 +3,8 @@ import { resolve } from "path";
 import { randomUUID } from "crypto";
 import { Hono } from "hono";
 import { serve } from "@hono/node-server";
-import { loadConfig, resolveModel, resolveVariant, resolveGithubAuth } from "./config/config.js";
+import { loadConfig, resolveModel, resolveVariant, resolveGithubAuth, getIssueFilter } from "./config/config.js";
+import { issueFilterApplies, issueFilterRefusal } from "./engine/issue-filter.js";
 import { ConnectorRegistry, GitHubWebhookConnector, SlackConnector, SessionManager, recordThreadMessageForThread } from "./connectors/index.js";
 import {
   dispatch,
@@ -522,6 +523,57 @@ async function main() {
       const msg = `dispatchWorkflow(${workflowName}): refusing repo-disabled workflow: ${refusal}`;
       log.warn(msg, { workflowName, refusal });
       return { success: false, error: msg };
+    }
+
+    // Choke-point issue label filter (fork patch). The operator names the
+    // labels in `issueFilter.requiredLabels`; see `engine/issue-filter.ts`.
+    // The context labels come from the webhook payload. When they are empty,
+    // read the issue from GitHub. When the read fails, refuse the run: the
+    // filter must not let an unknown issue through.
+    const issueFilter = getIssueFilter();
+    const filterIssueNumber = typeof context.issueNumber === "number" ? context.issueNumber : undefined;
+    if (
+      issueFilterApplies(issueFilter, {
+        workflowName,
+        issueNumber: filterIssueNumber,
+        prNumber: typeof context.prNumber === "number" ? context.prNumber : undefined,
+      })
+    ) {
+      let filterLabels: string[] | null = Array.isArray(context.labels)
+        ? (context.labels as unknown[]).filter((l): l is string => typeof l === "string")
+        : [];
+      if (filterLabels.length === 0) {
+        filterLabels = null;
+        if (github && owner && repo && filterIssueNumber !== undefined) {
+          try {
+            const issue = await github.getIssue(owner, repo, filterIssueNumber);
+            filterLabels = (issue.labels || [])
+              .map((l: any) => (typeof l === "string" ? l : l?.name))
+              .filter((l: unknown): l is string => typeof l === "string" && l !== "");
+          } catch (err: unknown) {
+            log.warn("Could not read the issue labels for the issue filter", {
+              workflowName,
+              repo: repoStr,
+              issueNumber: filterIssueNumber,
+              err,
+            });
+          }
+        }
+      }
+      const filterRefusal = filterLabels === null
+        ? "the issue labels could not be read"
+        : issueFilterRefusal(issueFilter, filterLabels);
+      if (filterRefusal) {
+        // `success: true`, the same as the kill switch: the operator asked for
+        // this skip, so a cron fan-out must not count it as a failure.
+        log.info("Skipped — issue label filter", {
+          workflowName,
+          repo: repoStr,
+          issueNumber: filterIssueNumber,
+          reason: filterRefusal,
+        });
+        return { success: true };
+      }
     }
 
     // ── The BUILD dispatch gate (the issue side of the same rule) ──────────

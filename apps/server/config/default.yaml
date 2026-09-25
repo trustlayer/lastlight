@@ -352,6 +352,16 @@ bootstrap:
 hold:
   label: lastlight-ignore
 
+# The issue label filter (fork patch). When `requiredLabels` is not empty, Last
+# Light starts a workflow in `workflows` on an issue only when the issue has one
+# of the labels. The label comparison ignores the case. An empty list turns the
+# filter off. A repo-wide triage scan has no issue number, so the filter does
+# not apply to it. Example: `requiredLabels: [bug]` stops the triage and the
+# build of an issue that has no `bug` label.
+issueFilter:
+  requiredLabels: []
+  workflows: [issue-triage, build]
+
 explore:
   defaultRepo: null
 
