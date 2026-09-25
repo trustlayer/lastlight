@@ -129,6 +129,69 @@ function isCleanDischarge(row: unknown): boolean {
 }
 
 /**
+ * Split a `hypotheses/*.jsonl` into rows — a copy of code-facts' `parseJsonl`
+ * (`packages/code-facts/src/jsonl.ts`), which core does not depend on. The
+ * ordinal a row lands on is the id `findings[].hypotheses[]` cites, so this
+ * must accept exactly the rows that does: a line that parses on its own, or a
+ * pretty-printed / run-together value recovered by a brace-balanced scan (some
+ * models pretty-print their rows; a line reader dropped them). A torn final
+ * line on a killed run is normal and consumes no ordinal. Keep the two in step.
+ */
+export function parseJsonlRows(text: string): unknown[] {
+  const rows: unknown[] = [];
+  let pos = 0;
+  while (pos < text.length) {
+    const newline = text.indexOf("\n", pos);
+    const lineEnd = newline === -1 ? text.length : newline;
+    const raw = text.slice(pos, lineEnd);
+    const line = raw.trim();
+    if (!line) {
+      pos = lineEnd + 1;
+      continue;
+    }
+    try {
+      rows.push(JSON.parse(line) as unknown);
+      pos = lineEnd + 1;
+      continue;
+    } catch {
+      /* not a row on its own — try it as the start of a span */
+    }
+    const start = pos + raw.length - raw.trimStart().length;
+    const end = text[start] === "{" || text[start] === "[" ? closingIndex(text, start) : -1;
+    if (end !== -1) {
+      try {
+        rows.push(JSON.parse(text.slice(start, end)) as unknown);
+        pos = end;
+        continue;
+      } catch {
+        /* balanced but not JSON */
+      }
+    }
+    pos = lineEnd + 1; // unreadable: consumes no ordinal, and never the next line
+  }
+  return rows;
+}
+
+/** Where the value opening at `start` closes, or -1 if the text ends first. */
+function closingIndex(text: string, start: number): number {
+  let depth = 0;
+  let inString = false;
+  for (let i = start; i < text.length; i += 1) {
+    const ch = text[i];
+    if (inString) {
+      if (ch === "\\") i += 1;
+      else if (ch === '"') inString = false;
+    } else if (ch === '"') inString = true;
+    else if (ch === "{" || ch === "[") depth += 1;
+    else if (ch === "}" || ch === "]") {
+      depth -= 1;
+      if (depth === 0) return i + 1;
+    }
+  }
+  return -1;
+}
+
+/**
  * Which hypothesis ids in `<dir>/hypotheses/*.jsonl` are clean discharges.
  *
  * **`undefined` means there is no `hypotheses/` directory at all** — the
@@ -175,17 +238,7 @@ export function readCleanDischarges(
     const family = basename(file, ".jsonl");
     let rows: unknown[];
     try {
-      rows = readFileSync(join(dir, "hypotheses", file), "utf8")
-        .split("\n")
-        .map((line) => line.trim())
-        .filter((line) => line.length > 0)
-        .flatMap((line) => {
-          try {
-            return [JSON.parse(line) as unknown];
-          } catch {
-            return []; // a torn final line on a killed run is normal
-          }
-        });
+      rows = parseJsonlRows(readFileSync(join(dir, "hypotheses", file), "utf8"));
     } catch {
       continue; // unreadable file — the other families still count
     }
@@ -246,30 +299,6 @@ function dispatchReview(ctx: TemplateContext): HeadReview | null {
 function toBudget(v: unknown, fallback: number): number {
   const n = Number(v);
   return Number.isFinite(n) && n >= 0 ? Math.floor(n) : fallback;
-}
-
-/** Like {@link toBudget} but fractional — `internalFloor` is a 0..1 bar. */
-function toFloor(v: unknown, fallback: number): number {
-  const n = Number(v);
-  return Number.isFinite(n) && n >= 0 ? n : fallback;
-}
-
-/** The one JSON-valued context key; an unparseable value means "no bars". */
-function parseThresholds(v: unknown): Record<string, number> {
-  if (typeof v !== "string" || v === "") return {};
-  try {
-    const parsed: unknown = JSON.parse(v);
-    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed))
-      return {};
-    const out: Record<string, number> = {};
-    for (const [k, val] of Object.entries(parsed)) {
-      const n = Number(val);
-      if (Number.isFinite(n)) out[k] = n;
-    }
-    return out;
-  } catch {
-    return {};
-  }
 }
 
 /**
@@ -517,6 +546,29 @@ export class GitHubPostReviewHandler implements PhaseTypeHandler {
           ...anchored.stats,
         });
       }
+      // Warn, never fail, and deliberately NOT inside the `if` above: that
+      // one fires only when something RESOLVED, so the case where every
+      // excerpt failed — the case worth knowing about — logged nothing at all.
+      // Measured 2026-09-21 over all 54 off-diff demotions in the preserved
+      // archive: 26 carried an excerpt matching nothing, and 22 of those came
+      // from ONE case-run whose `existingCode` held prose rather than code.
+      // The cascade is behaving correctly there; the adjudicator is not
+      // honouring its own output contract, and nothing a run wrote said so.
+      if (anchored.stats.unresolved > 0) {
+        log.warn(
+          "findings quote code that is not in the file they name — anchoring to the body",
+          {
+            repo: `${owner}/${repo}`,
+            prNumber,
+            count: anchored.stats.unresolved,
+            // Capped: one measured case produced 22 of these and a log line
+            // is not a report. The count above is the honest total.
+            findings: anchored.unresolvedExcerpts
+              .slice(0, 10)
+              .map((f) => `${f.path}: ${f.title}`),
+          },
+        );
+      }
       doc = { ...doc, findings: anchored.findings };
     }
 
@@ -554,8 +606,8 @@ export class GitHubPostReviewHandler implements PhaseTypeHandler {
     // WP6b — the attention boundary, and it exists ONLY when the evidence
     // pipeline is on. `undefined` here is not a default, it is the whole
     // inertness guarantee: `buildReview` takes its pre-WP6b branch and a
-    // deployment that never opted in gets no cap, no thresholds and no
-    // `internal` tier, whatever a findings.json happens to carry.
+    // deployment that never opted in gets no cap and no `internal` tier,
+    // whatever a findings.json happens to carry.
     const boundary = this.attentionBoundary();
     // The anti-finding rule (below). Read ONLY when a boundary exists, so a
     // deployment that never opted in does not even stat the directory — the
@@ -793,21 +845,16 @@ export class GitHubPostReviewHandler implements PhaseTypeHandler {
     // `getRuntimeConfig()` silently applies the packaged defaults to every
     // eval arm — found on this pipeline's own PR after three repeats of an
     // arm that pinned `maxBodyComments: null` each recorded 5–14
-    // `body-budget` demotions. `specContext` projects all four fields
-    // together, so their presence is atomic; production projects them from
-    // the same runtime config this fallback reads, so the two authorities
-    // cannot disagree there.
+    // `body-budget` demotions. `specContext` projects both fields together,
+    // so their presence is atomic — the test is on `maxInlineComments` for
+    // both — and production projects them from the same runtime config this
+    // fallback reads, so the two authorities cannot disagree there.
     const ctx = this.run.ctx as Record<string, unknown>;
     if (typeof ctx.maxInlineComments === "string") {
       return {
         maxInlineComments: toBudget(
           ctx.maxInlineComments,
           defaultReviewPolicy().analysis.maxInlineComments,
-        ),
-        thresholds: parseThresholds(ctx.boundaryThresholds),
-        internalFloor: toFloor(
-          ctx.internalFloor,
-          defaultReviewPolicy().analysis.internalFloor,
         ),
         // `"null"` is the literal the projection writes for the documented
         // "unlimited body overflow" value; anything else degrades to the
@@ -827,8 +874,6 @@ export class GitHubPostReviewHandler implements PhaseTypeHandler {
       getRuntimeConfig()?.review?.analysis ?? defaultReviewPolicy().analysis;
     return {
       maxInlineComments: analysis.maxInlineComments,
-      thresholds: analysis.thresholds ?? {},
-      internalFloor: analysis.internalFloor,
       // Nullable on purpose — `null` is the documented "unlimited body
       // overflow" value, so it must survive this projection rather than be
       // defaulted away. `??` here would erase the operator's explicit choice.

@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { TemplatedNumberSchema } from "./templated-number.js";
+import { CommandPolicySchema } from "./command-policy.js";
 
 // ── Output rules ──────────────────────────────────────────────────────
 
@@ -145,8 +146,8 @@ const FanoutBranchSchema = z
         /^[A-Za-z0-9][A-Za-z0-9-]*$/,
         "a fanout branch name must be alphanumeric with hyphens (no underscores — see PhaseRef)",
       )
-      .refine((n) => !/-(retry|check)$/.test(n), {
-        message: "a fanout branch name may not end in `-retry` or `-check` (reserved ledger suffixes)",
+      .refine((n) => !/-(retry|check|regate)$/.test(n), {
+        message: "a fanout branch name may not end in `-retry`, `-check` or `-regate` (reserved ledger suffixes)",
       }),
     /** Prompt template for this branch. Falls back to the phase's own `prompt`. */
     prompt: z.string().optional(),
@@ -156,6 +157,11 @@ const FanoutBranchSchema = z
     /** Model / reasoning-effort override. Falls back to the phase's. */
     model: z.string().optional(),
     variant: z.string().optional(),
+    /**
+     * Command-policy override for this branch. REPLACES the phase's
+     * `command_policy` whole (no per-class merge), like `model` and `skills`.
+     */
+    command_policy: CommandPolicySchema.optional(),
     /**
      * Post-branch condition, run in the SAME workspace after every branch has
      * joined. Observational, exactly like a `generic_loop.until_bash` on a loop
@@ -363,6 +369,23 @@ const PhaseDefinitionSchema = z
      */
     web_search: z.boolean().optional(),
     /**
+     * Which classes of bash command this agent phase may run (issue #403):
+     * `install` (a package-manager install in the checkout), `install-scratch`
+     * (an install outside it — `/tmp/probe`, a global — falling back to
+     * `install`'s mode), and `test` (test runners and the project's
+     * `test`/`lint`/`typecheck` scripts). Each is `allow` (the default),
+     * `log` (run it and emit a `command_policy` event) or `block` (refuse it,
+     * emit the event, and hand the model `reason`). A mode may be read from
+     * the run context — `test: { from: probeTestPolicy }` — see
+     * `core/command-policy.ts`.
+     *
+     * Enforced by agentic-pi on the bash tool, on every sandbox backend. A
+     * pattern guard, not a security boundary: `sh -c "$(…)"` or a script
+     * under another name gets past it; the sandbox and egress policy stay the
+     * boundary. Ignored on non-agent phases.
+     */
+    command_policy: CommandPolicySchema.optional(),
+    /**
      * Capability gate: the sandbox backend this phase needs to run on.
      *
      * Default (absent): the phase runs on whatever backend the harness is
@@ -501,6 +524,28 @@ const PhaseDefinitionSchema = z
         then: z.enum(["fail", "complete"]).default("complete"),
       })
       .optional(),
+    /**
+     * What a branch whose `until_bash` gate did NOT close gets: `retries: 1`
+     * re-runs that branch once, in the same workspace, with the gate's own
+     * output appended to its prompt as the instruction ("O-003…O-011 are named
+     * by no row; rows 1–4 carry no evidence"), then runs the gate again.
+     *
+     * Absent ⇒ `{ retries: 0 }`: the gate stays OBSERVATIONAL, recording
+     * `condition_met` / `condition_not_met` and changing nothing — the
+     * behaviour every fan-out had before this key. Capped at 1 because the
+     * point is one directed correction, not a loop: a branch that cannot close
+     * its gate in two attempts is reporting something the next phase has to
+     * read, and paying for a third attempt hides it.
+     *
+     * Only a gate that RAN and said no triggers it. A gate that timed out or
+     * could not run, a branch that hard-failed, and a branch skipped on resume
+     * are never re-run.
+     */
+    on_branch_gate_failure: z
+      .object({
+        retries: z.number().int().min(0).max(1).default(0),
+      })
+      .optional(),
     /** Rules applied to agent output */
     on_output: PhaseOnOutputSchema.optional(),
     /** Actions taken on successful completion */
@@ -583,7 +628,7 @@ const PhaseDefinitionSchema = z
         }
       }
     } else {
-      for (const key of ["branches", "max_concurrent", "on_branch_soft_failure"] as const) {
+      for (const key of ["branches", "max_concurrent", "on_branch_soft_failure", "on_branch_gate_failure"] as const) {
         if (p[key] !== undefined) {
           ctx.addIssue({ code: z.ZodIssueCode.custom, message: `\`${key}:\` is only valid on type \`fanout\`` });
         }

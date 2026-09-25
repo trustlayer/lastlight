@@ -2,6 +2,7 @@ import type { Context, Span } from "@opentelemetry/api";
 import { context, SpanStatusCode, trace } from "@opentelemetry/api";
 import { safeSpanAttributes, setSpanAttributes } from "./index.js";
 import {
+  LlmResponse,
   OI,
   SpanKind,
   llmTokenAttributes,
@@ -102,6 +103,13 @@ export function sanitizePiEvent(record: Record<string, unknown>, includeContent 
           .join(",");
       }
       break;
+    case "command_policy":
+      for (const key of ["action", "class", "pattern"]) {
+        const value = record[key];
+        if (typeof value === "string") out[`command_policy.${key}`] = value;
+      }
+      if (includeContent && typeof record.command === "string") out["command_policy.command"] = trunc(record.command);
+      break;
     case "usage_snapshot":
       for (const key of ["turns", "costUsd", "inputTokens", "outputTokens", "cacheReadInputTokens", "cacheCreationInputTokens"]) {
         const value = record[key];
@@ -141,6 +149,10 @@ interface MessageLike {
   content?: unknown;
   provider?: string;
   model?: string;
+  responseModel?: string;
+  stopReason?: string;
+  rawStopReason?: string;
+  providerThinkingLevel?: string;
   usage?: {
     input?: number;
     output?: number;
@@ -275,6 +287,12 @@ export class AgentSpanTree {
     if (!t) return;
     // Refine the per-turn model/provider from the actual assistant message.
     if (m.model || m.provider) setSpanAttributes(t.span, this.llmModelAttrs(m.model, m.provider));
+    setSpanAttributes(t.span, {
+      ...(m.responseModel ? { [LlmResponse.MODEL]: m.responseModel } : {}),
+      ...(m.stopReason ? { [LlmResponse.STOP_REASON]: m.stopReason } : {}),
+      ...(m.rawStopReason ? { [LlmResponse.RAW_STOP_REASON]: m.rawStopReason } : {}),
+      ...(m.providerThinkingLevel ? { [LlmResponse.PROVIDER_THINKING_LEVEL]: m.providerThinkingLevel } : {}),
+    });
     const usage = m.usage;
     if (usage) {
       t.usage.input = (t.usage.input ?? 0) + num(usage.input);

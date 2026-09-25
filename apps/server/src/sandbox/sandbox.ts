@@ -3,6 +3,7 @@ import { mkdtempSync, mkdirSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { spawnSync } from "child_process";
 import type { run as agenticRunType, RunResult, ThinkingLevel } from "agentic-pi";
+import type { CommandPolicy } from "lastlight-workflow-engine";
 import type { OtelConfig, SandboxBackend } from "../config/config.js";
 import type { ServiceSet } from "lastlight-shared/sandbox-services";
 import { resolveKubernetesConfig } from "../config/config.js";
@@ -206,6 +207,12 @@ export interface RunAgentOpts {
    * `gateTimeoutSeconds` for the in-process adapter.
    */
   gateTimeoutSeconds: number;
+  /**
+   * The phase's resolved `command_policy` (issue #403). The in-process adapter
+   * passes it to `run()`; the container backends receive the same JSON as
+   * `AGENTIC_PI_COMMAND_POLICY` in {@link sandboxEnv}, set by the orchestrator.
+   */
+  commandPolicy?: CommandPolicy;
 }
 
 export interface RunCommandOpts {
@@ -653,12 +660,25 @@ class InProcessSandbox implements Sandbox {
       cwd: opts.agentCwd,
       noSession: true,
       skillPaths: opts.skillDirs,
+      // A phase's `skills:` key is the WHOLE list, not a starting point.
+      // Without this, Pi's own discovery runs and every skill that happens to
+      // be on the host joins the catalogue: measured 2026-09-22, all 69 agent
+      // sessions of an 8-case eval arm carried the operator's personal
+      // `~/.agents/skills` (writing-great-skills, tdd, to-prd, triage, …) into
+      // a `pr-review` reviewer that had declared exactly `[survey-pass]`. That
+      // makes a measurement machine-dependent and puts unreviewed instructions
+      // in front of a `repo-write` agent. Same shape as `--no-web-search`
+      // below/in docker.ts: an ambient capability is ON unless switched off.
+      // Pi loads explicit `skillPaths` even with this set, so the declared
+      // list still arrives — it is the ONLY thing that arrives.
+      noSkills: true,
       allowedHttpHosts,
       webSearch: opts.webSearch === true,
       webSearchProvider: opts.webSearchProvider,
       // The run's effective gate budget — agentic-pi adds its gate guidance to
       // the bash tool only when this is set, so core always sets it.
       gateTimeoutSeconds: opts.gateTimeoutSeconds,
+      commandPolicy: opts.commandPolicy,
       onEvent,
       onWarn: (msg) => logger("agentic").warn(msg),
     });

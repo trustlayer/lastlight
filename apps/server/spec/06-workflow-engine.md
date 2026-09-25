@@ -211,9 +211,11 @@ router routed nine, which is why the dashboard showed no Slack trigger for
   branches?: FanoutBranch[];            // type: fanout only — required there, rejected elsewhere
   max_concurrent?: number | { from: string; default: number };  // fanout width, clamped by the backend ceiling
   on_branch_soft_failure?: { retries: number; then: "fail" | "complete" };  // per-BRANCH; not generic_loop's key
+  on_branch_gate_failure?: { retries: 0 | 1 };  // fanout only — re-run a branch whose until_bash said no, once
   output_var?: string;                  // alias for {{this.field}} in later phases
   unrestricted_egress?: boolean;        // bypass strict allowlist for this phase
   web_search?: boolean;                 // enable agentic-pi web tools
+  command_policy?: CommandPolicy;       // allow|log|block per bash command class (install, install-scratch, test); see "Command policy"
   requires_sandbox?: "docker" | "gondolin" | "none";  // skip phase (non-failing) if active backend differs
   sandbox_image?: "default" | "qa";     // docker only: "qa" runs on lastlight-sandbox-qa (Playwright+Chromium+ffmpeg); skips if unbuilt
   skip_if?: string | string[];          // skip phase (non-failing) when any expression matches the render context
@@ -354,6 +356,7 @@ extend when a deployment needs a step the engine should not know about.
   model: "{{models.review-survey}}"
   max_concurrent: { from: surveyConcurrency, default: 6 }
   on_branch_soft_failure: { retries: 1, then: complete }
+  on_branch_gate_failure: { retries: 1 }
   branches:
     - name: contract
       prompt: prompts/survey-contract.md
@@ -368,7 +371,7 @@ Each branch inherits the phase's `prompt` / `skills` / `model` /
 `variant` and may override any of them. Branch names are **ledger
 keys**, so they are alphanumeric-with-hyphens (no underscores, which
 `PhaseRef` uses as its separator), must be unique, and may not end in
-the reserved `-retry` / `-check` suffixes.
+the reserved `-retry` / `-check` / `-regate` suffixes.
 
 **A branch's `skills` REPLACES the phase's — it does not union with it**
 (`branchPhase()` in `handlers/fanout.ts`), so an override has to re-list
@@ -429,9 +432,25 @@ one `current_phase`, one artifact harvest, one dispose.
    loop — so interleaving a gate with the agent turns would serialise
    the entire fan-out on `none`, the very backend the fan-out exists to
    speed up. Each gate records a `<phase>_branch_<name>_check` ledger
-   row with `condition_met` / `condition_not_met`; it is observational
-   and can never fail the phase.
-5. One harvest, one dispose.
+   row with `condition_met` / `condition_not_met`, and can never fail
+   the phase.
+5. **`on_branch_gate_failure: { retries: 1 }`** re-runs, once, every
+   branch whose gate **ran and said no** — concurrently, through the same
+   pool — then runs those branches' gates again (a second `_check` row
+   under the same label). The re-run is its own ledger row and phase
+   window, `<phase>_branch_<name>_regate` (not `_retry`: the soft retry
+   may already hold that key, and a done row is skipped on dedup). Its
+   prompt is the first attempt's prompt with the gate's command and
+   verbatim output appended **last**, so it shares the cached prefix;
+   the instruction is to fix flagged rows in place and answer only what
+   the output names. A gate that timed out or could not run, a branch
+   that hard-failed, and a branch deduped on resume are never re-run. A
+   re-run that fails leaves the first attempt's result standing. Absent
+   the key the gate stays purely observational — every fan-out's
+   behaviour before it existed. `pr-review`'s `survey` declares it,
+   because an observational gate let a half-done hypotheses file (2 of
+   12 seeded checks answered) go downstream as if complete.
+6. One harvest, one dispose.
 
 **Concurrency is `min(max_concurrent, backend ceiling)`**, and the
 clamp is logged when the host has the last word:
@@ -1150,6 +1169,48 @@ does for a non-loop phase. Reaching `max_iterations` without the condition is
 paths are exempt because they produce no fresh turn to sign off: a deduplicated
 (already-completed) phase on resume, and the `on_soft_failure: complete`
 advance.
+
+### Command policy
+
+An agent phase (and a fan-out branch) may declare which classes of bash command
+its agent may run (issue #403):
+
+```yaml
+command_policy:
+  install: block                                   # allow | log | block
+  install-scratch: { from: probeScratchInstallPolicy }
+  test: { from: probeTestPolicy }
+  reason: "…"                                      # model-facing text for a blocked call
+```
+
+- **Classes.** `install` — a package-manager install in the checkout;
+  `install-scratch` — an install whose directory is outside it (`cd /tmp/probe
+  && npm i x`, `--prefix`, `-g`), falling back to `install`'s mode when unset;
+  `test` — test runners and the project's `test`/`lint`/`typecheck` scripts.
+  An absent class is `allow`. The schema is `.strict()`: an unknown class or
+  mode is a load error.
+- **Modes.** `allow` runs it. `log` runs it and emits a `command_policy` event.
+  `block` refuses it — the model gets `reason` as the tool result and carries on
+  — and emits the same event. Each event becomes a structured `command policy`
+  log line (with the phase), a rendered `system` line in the phase's session
+  transcript, and `command_policy.*` span attributes.
+- **Templated modes.** `{ from: <ctx key>, default?: <mode> }`, resolved by
+  `phaseConfigFor` against the run context. A present value that is not a mode
+  throws (default or not); an absent key uses `default`, or throws without one.
+- **Fan-out.** A branch's `command_policy` replaces the phase's whole — no
+  per-class merge, like `model` and `skills`.
+- **Enforcement** is agentic-pi's (a pi `tool_call` handler over a pattern
+  table), on every sandbox backend — see [Sandbox](/spec/09-sandbox). A pattern
+  guard, not a security boundary: `sh -c "$(…)"` or a script under another name
+  gets past it.
+
+`pr-review.yaml` sets `survey` and `adjudicate` to `install: block, test:
+block`. `review` blocks `test` always and `install` only when
+`review.analysis.enabled` (context key `reviewInstallPolicy`; with the pipeline
+off the `pr-review` skill's install-to-probe affordance stands). `falsify`
+blocks `install` in every mode and reads `test` / `install-scratch` from
+`probeTestPolicy` / `probeScratchInstallPolicy`: `log` under `probes: full`
+(`prepare` installed the tree), `block` under `probes: static`.
 
 ## Invariants
 
