@@ -290,6 +290,73 @@ type PrePopulate = {
  */
 export { prePopulateWorkspace as __prePopulateWorkspaceForTest };
 
+// GitHub sometimes rejects a clone with an installation token that was minted
+// a few hundred milliseconds before: it answers "Repository not found" (or an
+// auth error) and the next attempt succeeds. Seen in production on
+// 2026-09-25 with a token that the mint call had just granted for the repo.
+// Only these answers are retried. A missing branch is not transient and has
+// its own fallback in the callers.
+const TRANSIENT_CLONE_RE =
+  /Repository not found|Authentication failed|could not read Username|The requested URL returned error: (401|403|5\d\d)|HTTP 5\d\d|Could not resolve host|Connection reset|Connection timed out/i;
+
+let cloneRetryDelaysMs = [2_000, 4_000];
+
+/** Test hook: shorten the waits between clone attempts. */
+export function __setCloneRetryDelaysForTest(delays: number[]): void {
+  cloneRetryDelaysMs = delays;
+}
+
+function sleepSync(ms: number): void {
+  if (ms > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * `git clone` with a retry on a transient GitHub answer. The caller passes the
+ * full argv. The last error is thrown when every attempt fails, so the
+ * callers' own error handling stays the same.
+ */
+function gitCloneWithRetry(
+  args: string[],
+  repoDir: string,
+  pre: PrePopulate,
+  scrub: (s: unknown) => string,
+): void {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      execFileSync("git", args, { stdio: "pipe", timeout: 120_000 });
+      return;
+    } catch (err: any) {
+      const reason = scrub(err?.message) || scrub(err?.stderr?.toString?.()) || "unknown error";
+      if (attempt >= cloneRetryDelaysMs.length || !TRANSIENT_CLONE_RE.test(reason)) throw err;
+      log.warn("Clone failed with a transient error — retrying", {
+        owner: pre.owner,
+        repo: pre.repo,
+        attempt: attempt + 1,
+        delayMs: cloneRetryDelaysMs[attempt],
+        reason,
+      });
+      // A failed clone normally removes its target, but a partial one would
+      // make the next attempt fail with "already exists".
+      rmSync(repoDir, { recursive: true, force: true });
+      sleepSync(cloneRetryDelaysMs[attempt]);
+    }
+  }
+}
+
+/**
+ * Every backend starts the agent with its cwd at `<workspace>/<repo>`. When the
+ * pre-clone fails, that directory does not exist and `docker exec -w` exits
+ * 127 before the agent starts, so the MCP clone fallback never runs. An empty
+ * directory lets the agent start and clone there.
+ */
+function ensureRepoDir(repoDir: string): void {
+  try {
+    mkdirSync(repoDir, { recursive: true });
+  } catch (err) {
+    log.warn("Could not create the empty repo dir after a failed pre-clone", { repoDir, err });
+  }
+}
+
 export function prePopulateWorkspace(
   workDir: string,
   pre: PrePopulate,
@@ -382,10 +449,11 @@ export function prePopulateWorkspace(
     return;
   }
   try {
-    execFileSync(
-      "git",
+    gitCloneWithRetry(
       [...authArgs, "clone", "--branch", pre.branch, "--depth", depth, ...shallowArgs, url, repoDir],
-      { stdio: "pipe", timeout: 120_000 },
+      repoDir,
+      pre,
+      scrub,
     );
     normalizeOrigin(repoDir, pre);
     ensureBaseAvailable(repoDir, pre, authArgs, url, scrub);
@@ -420,6 +488,7 @@ export function prePopulateWorkspace(
       branch: pre.branch,
       reason: firstError,
     });
+    ensureRepoDir(repoDir);
   }
 }
 
@@ -444,10 +513,11 @@ function cloneDefaultAndCreateBranch(
   scrub: (s: unknown) => string,
 ): void {
   try {
-    execFileSync(
-      "git",
+    gitCloneWithRetry(
       [...authArgs, "clone", "--depth", depth, ...shallowArgs, url, repoDir],
-      { stdio: "pipe", timeout: 120_000 },
+      repoDir,
+      pre,
+      scrub,
     );
     execFileSync(
       "git",
@@ -473,6 +543,7 @@ function cloneDefaultAndCreateBranch(
       repo: pre.repo,
       reason,
     });
+    ensureRepoDir(repoDir);
   }
 }
 

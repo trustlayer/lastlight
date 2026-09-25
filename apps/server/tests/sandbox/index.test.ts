@@ -37,7 +37,10 @@ import {
 } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { __prePopulateWorkspaceForTest as prePopulateWorkspace } from "#src/sandbox/index.js";
+import {
+  __prePopulateWorkspaceForTest as prePopulateWorkspace,
+  __setCloneRetryDelaysForTest,
+} from "#src/sandbox/index.js";
 
 const mockExec = vi.mocked(execFileSync);
 
@@ -491,5 +494,85 @@ describe("prePopulateWorkspace recreate-from-base (build, issue #153)", () => {
     // Same run → no git ops, no delete (the architect's plan.md must survive).
     expect(mockExec).not.toHaveBeenCalled();
     expect(existsSync(join(workDir, REPO, ".git"))).toBe(true);
+  });
+});
+
+describe("prePopulateWorkspace clone retry on a transient GitHub answer", () => {
+  let workDir: string;
+  const REPO = "lastlight";
+  const notFound = () =>
+    Object.assign(new Error(
+      "Command failed: git clone https://github.com/cliftonc/lastlight.git\n" +
+      "remote: Repository not found.\n" +
+      "fatal: repository 'https://github.com/cliftonc/lastlight.git/' not found",
+    ), { status: 128 });
+
+  beforeEach(() => {
+    workDir = mkdtempSync(join(tmpdir(), "ll-retry-"));
+    __setCloneRetryDelaysForTest([0, 0]);
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+    mockExec.mockReset();
+    __setCloneRetryDelaysForTest([2_000, 4_000]);
+    rmSync(workDir, { recursive: true, force: true });
+  });
+
+  function clones(): string[][] {
+    return calledArgs().filter((a) => gitVerb(a) === "clone");
+  }
+
+  it("retries a 'Repository not found' clone and succeeds on the next attempt", () => {
+    let n = 0;
+    mockExec.mockImplementation(((_cmd: string, args: string[]) => {
+      if (gitVerb(args) === "clone" && n++ === 0) throw notFound();
+      return Buffer.from("");
+    }) as any);
+    prePopulateWorkspace(workDir, {
+      owner: "cliftonc", repo: REPO, branch: "main", token: TOKEN, runId: "run-1",
+    });
+    expect(clones()).toHaveLength(2);
+    expect(readFileSync(join(workDir, ".lastlight-run"), "utf-8")).toBe("run-1");
+    const warned = warnSpy.mock.calls.map((c) => c[0]);
+    expect(warned).toContain("Clone failed with a transient error — retrying");
+    expect(warned).not.toContain("Pre-clone failed — agent will need to clone via MCP");
+  });
+
+  it("retries the default-branch clone of a build (recreateFromBase)", () => {
+    let n = 0;
+    mockExec.mockImplementation(((_cmd: string, args: string[]) => {
+      if (gitVerb(args) === "clone" && n++ === 0) throw notFound();
+      return Buffer.from("");
+    }) as any);
+    prePopulateWorkspace(workDir, {
+      owner: "cliftonc", repo: REPO, branch: "lastlight/1-x", token: TOKEN,
+      runId: "run-1", shallow: false, recreateFromBase: true,
+    });
+    expect(clones()).toHaveLength(2);
+    expect(calledArgs().some((a) => a.includes("checkout"))).toBe(true);
+  });
+
+  it("does not retry an error that is not transient", () => {
+    mockExec.mockImplementation((() => {
+      throw new Error("fatal: could not create work tree dir");
+    }) as any);
+    prePopulateWorkspace(workDir, {
+      owner: "cliftonc", repo: REPO, branch: "main", token: TOKEN,
+    });
+    expect(clones()).toHaveLength(1);
+  });
+
+  it("gives up after three attempts and leaves an empty repo dir for the agent cwd", () => {
+    mockExec.mockImplementation((() => { throw notFound(); }) as any);
+    prePopulateWorkspace(workDir, {
+      owner: "cliftonc", repo: REPO, branch: "main", token: TOKEN,
+    });
+    expect(clones()).toHaveLength(3);
+    expect(existsSync(join(workDir, REPO))).toBe(true);
+    expect(existsSync(join(workDir, REPO, ".git"))).toBe(false);
+    const warned = warnSpy.mock.calls.map((c) => c[0]);
+    expect(warned).toContain("Pre-clone failed — agent will need to clone via MCP");
+    const logged = JSON.stringify(warnSpy.mock.calls);
+    expect(logged).not.toContain(TOKEN);
   });
 });
