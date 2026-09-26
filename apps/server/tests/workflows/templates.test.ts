@@ -58,10 +58,9 @@ describe("renderTemplate — {{artifactUrl}} (build-assets mode)", () => {
     );
   });
 
-  it("server mode with the relocated issueDir → the key has no ../ prefix", () => {
-    // A whole-workspace backend (docker, kubernetes) moves the docs out of the
-    // checkout to `../.lastlight/<key>` (see artifactIssueDir). The store key
-    // is still `issue-42`: it rejects a key with a `/` with a 400.
+  it("server mode with a relocated issueDir (whole-workspace backend) → bare store key", () => {
+    // docker/kubernetes move the docs out of the checkout to ../.lastlight/<key>
+    // (artifactIssueDir in simple.ts); the store only accepts the bare key (#400).
     const result = renderTemplate("{{artifactUrl architect-plan.md}}", {
       ...BASE_CTX,
       issueDir: "../.lastlight/issue-42",

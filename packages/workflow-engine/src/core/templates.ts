@@ -227,9 +227,9 @@ export function renderTemplate(template: string, ctx: TemplateContext): string {
     const branchHref = `https://github.com/${ctx.owner}/${ctx.repo}/blob/${encodeURIComponent(ctx.branch)}/${ctx.issueDir}/${file}`;
     if (!ctx.externalizeArtifacts) return branchHref;
     if (!ctx.publicUrl) return branchHref;
-    // A whole-workspace backend relocates the docs to `../.lastlight/<key>`
-    // (artifactIssueDir in apps/server). Strip both prefixes: the store
-    // rejects a key that contains a `/`.
+    // Whole-workspace backends relocate the docs to ../.lastlight/<key> (so
+    // `git add -A` skips them); the store key is the bare <key> either way,
+    // matching resume.ts.
     const issueKey = ctx.issueDir.replace(/^(?:\.\.\/)?\.lastlight\//, "");
     const base = String(ctx.publicUrl).replace(/\/+$/, "");
     const q =
