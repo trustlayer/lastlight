@@ -1,6 +1,6 @@
 {
   "name": "lastlight-workflow-engine",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/nearform/lastlight.git",
@@ -37,7 +37,7 @@
     "zod": "^4.3.6"
   },
   "devDependencies": {
-    "@types/node": "^26.2.0",
+    "@types/node": "^26.6.2",
     "typescript": "^7.0.2"
   }
 }
