@@ -59,7 +59,7 @@ There are four verdicts, strongest evidence first:
 | `refuted` | you ran something that WOULD have shown the defect and it did not | a transcript. **Only a transcript may refute** |
 | `unprobed` | nothing you could run would settle it | a `reason` naming WHICH constraint: no runner, no dependencies, no toolchain, or not the kind of claim execution decides |
 
-An `unprobed` or `corroborated` hypothesis **survives** to adjudication.
+An `unprobed` or `corroborated` hypothesis **survives** — it is kept, never deleted.
 
 ### Structural or behavioural — which one the claim is decides what `reproduced` needs
 
@@ -99,8 +99,8 @@ Concretely:
   `lastlight-facts facts --repo . …`.
 - **If you executed nothing, the verdict is `unprobed`**, with a `reason` saying
   which constraint stopped you. That is a completely acceptable outcome and it
-  costs the finding **nothing**: an `unprobed` hypothesis survives to
-  adjudication at lowered confidence, exactly as if you had never been asked.
+  costs the finding **nothing**: an `unprobed` hypothesis survives at
+  lowered confidence, exactly as if you had never been asked.
   There is no pressure here to manufacture a verdict — the only wrong answer is
   a claim of execution that did not happen.
 - **The gate reads your transcript's first line.** `lastlight-facts probes`
@@ -112,12 +112,20 @@ Concretely:
 
 ## What to probe
 
-Read every `.lastlight/pr-review/hypotheses/*.jsonl` line. Probe:
+Read `.lastlight/pr-review/probes/plan.md`. It lists, most important first, every
+hypothesis you owe a verdict on, each with its full record. **Probe exactly
+those** — nothing else needs a verdict, and the gate checks this list, not the
+hypothesis files. If it says there is nothing to probe, write no verdicts and stop.
 
-- every hypothesis with `"needsProbe": true`, and
-- **every** hypothesis with `"severity": "Critical"`, whether it asked or not.
+<!-- The list is computed, not left to you: severity is derived from each row's
+evidence record and never written on the row, so "probe every row whose
+`severity` is Critical" found nothing to probe — measured 2026-09-27, 1 verdict
+written against 21 owed. `lastlight-facts probe-plan` derives it, ranks the owed
+rows and caps them at `review.analysis.maxProbes`. -->
 
-Everything else you may leave alone entirely — it needs no verdict.
+If `plan.md` is missing, the plan step did not run: fall back to reading every
+`.lastlight/pr-review/hypotheses/*.jsonl` line and probe each one with
+`"needsProbe": true` or `"severity": "Critical"`.
 
 Read the **hypothesis record and the code**, not any earlier pass's reasoning.
 You are deliberately a fresh reader: trust your own execution over any claim in
@@ -180,7 +188,7 @@ package-manager cache or another project counts, whatever happens to be
 installed there. Never search outside the checkout for a dependency (`find /`,
 `find ~`, `ls ~/.nvm`), and never change `PATH` to point outside the workspace.
 If the dependency is not in the checkout, the hypothesis is `unprobed` with
-`"reason": "dependency not installed"`, and it survives to adjudication.
+`"reason": "dependency not installed"`, and it survives.
 
 <!-- MEASURED (issue #404, martian oc-survey-glmf arm, probes: static,
      --sandbox none): once installs were blocked, falsify went looking for the
@@ -207,7 +215,7 @@ running a program as such.
 
 Anything that needs a tier **above** these — a real install, a service, a
 network call, a full test suite — is `unprobed` with that named as the reason,
-and it **survives** to adjudication. Do not install anything to reach it.
+and it **survives**. Do not install anything to reach it.
 
 **Every probe must terminate on its own.** A probe is a question that gets an
 answer and stops; a command that keeps running is not a probe, whatever it

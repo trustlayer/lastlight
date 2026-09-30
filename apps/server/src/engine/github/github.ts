@@ -303,6 +303,29 @@ export interface LinkedIssueRead {
   body: string;
 }
 
+/**
+ * The PR's prior conversation, as {@link GitHubClient.getPullRequestDiscussion}
+ * reads it: the review verdicts, the inline review threads (with whether each
+ * was resolved) and the top-level comments. Bodies are bounded at read time.
+ */
+export interface PrDiscussionRead {
+  reviews: { author: string; isBot: boolean; state: string; body: string; submittedAt: string | null }[];
+  threads: {
+    path: string;
+    line: number | null;
+    isResolved: boolean;
+    isOutdated: boolean;
+    comments: { author: string; isBot: boolean; body: string }[];
+  }[];
+  /**
+   * The PR has more review threads than this read holds (`reviewThreads` is
+   * one page). A caller asking "is anything still open?" must treat the
+   * unseen rest as unknown, not as none.
+   */
+  threadsTruncated: boolean;
+  comments: { author: string; isBot: boolean; body: string; createdAt: string | null }[];
+}
+
 /** What {@link GitHubClient.listRepoDigestDetail} returns — the week's content, in one request. */
 export interface RepoDigestDetail {
   merged: MergedPrDetail[];
@@ -2055,6 +2078,59 @@ export class GitHubClient {
   }
 
   /**
+   * The PR's prior conversation in ONE GraphQL request: the last 30 reviews,
+   * the first 50 inline review threads (resolution is GraphQL-only — REST has
+   * no `isResolved`) with their first 5 comments, and the last 30 top-level
+   * comments. Read by `resolveSpecContext` only with the analysis pipeline on,
+   * so the `sites` engine's `select` can see what was already raised — the one
+   * thing the old reviewer's skill read that the pipeline did not.
+   */
+  async getPullRequestDiscussion(
+    owner: string,
+    repo: string,
+    pullNumber: number,
+    opts: { maxBodyChars?: number } = {},
+  ): Promise<PrDiscussionRead> {
+    const maxBody = Math.max(opts.maxBodyChars ?? 1500, 200);
+    const kit = await this.kit(owner);
+    const res = await kit.graphql<GraphQlPrDiscussion>(
+      `query($owner: String!, $repo: String!, $number: Int!) {
+         repository(owner: $owner, name: $repo) {
+           pullRequest(number: $number) {
+             reviews(last: 30) { nodes { author { __typename login } state body submittedAt } }
+             reviewThreads(first: 50) {
+               pageInfo { hasNextPage }
+               nodes {
+                 path line isResolved isOutdated
+                 comments(first: 5) { nodes { author { __typename login } body } }
+               }
+             }
+             comments(last: 30) { nodes { author { __typename login } body createdAt } }
+           }
+         }
+       }`,
+      { owner, repo, number: pullNumber },
+    );
+    const pr = res.repository?.pullRequest;
+    const who = (a: GraphQlAuthor | null | undefined) => ({ author: a?.login ?? "ghost", isBot: a?.__typename === "Bot" });
+    const cut = (b: string | null | undefined) => (b ?? "").slice(0, maxBody);
+    const nodes = <T>(c: { nodes?: Array<T | null> | null } | null | undefined): T[] =>
+      (c?.nodes ?? []).filter((n): n is T => !!n);
+    return {
+      reviews: nodes(pr?.reviews).map((r) => ({ ...who(r.author), state: r.state ?? "", body: cut(r.body), submittedAt: r.submittedAt ?? null })),
+      threads: nodes(pr?.reviewThreads).map((t) => ({
+        path: t.path ?? "",
+        line: typeof t.line === "number" ? t.line : null,
+        isResolved: t.isResolved === true,
+        isOutdated: t.isOutdated === true,
+        comments: nodes(t.comments).map((c) => ({ ...who(c.author), body: cut(c.body) })),
+      })),
+      threadsTruncated: pr?.reviewThreads?.pageInfo?.hasNextPage === true,
+      comments: nodes(pr?.comments).map((c) => ({ ...who(c.author), body: cut(c.body), createdAt: c.createdAt ?? null })),
+    };
+  }
+
+  /**
    * Fetch a PR's unified diff (three-dot, base…head) as a string. Used by the
    * `post-review` action to anchor findings to changed lines — the harness runs
    * this in-process (not in the sandbox), so the diff comes from the API rather
@@ -2162,6 +2238,13 @@ export class GitHubClient {
     state: "passing" | "failing" | "pending" | "none";
     settledCount: number;
     pendingCount: number;
+    /**
+     * When the ref's CI started being pending: the oldest `started_at` of a
+     * still-pending check run, or `created_at` of a pending status context.
+     * `null` unless `state` is `pending`, or when no pending entry carries a
+     * timestamp. Dates the review sweep's grace window.
+     */
+    pendingSince?: string | null;
   }> {
     const kit = await this.kit(owner);
     // `allSettled`, not `all` — the two legs need different permissions and
@@ -2205,7 +2288,18 @@ export class GitHubClient {
     }
 
     if (runPendingCount > 0 || statusPending) {
-      return { state: "pending", settledCount, pendingCount };
+      const stamps = [
+        ...runs
+          .filter((r) => r.status === "queued" || r.status === "in_progress")
+          .map((r) => r.started_at),
+        ...(statusPending
+          ? (statuses as Array<{ state?: string; created_at?: string | null }>)
+              .filter((st) => st.state === "pending")
+              .map((st) => st.created_at)
+          : []),
+      ].filter((t): t is string => typeof t === "string" && t.length > 0);
+      const pendingSince = stamps.length > 0 ? stamps.reduce((a, b) => (a < b ? a : b)) : null;
+      return { state: "pending", settledCount, pendingCount, pendingSince };
     }
 
     const runFailing = runs.some(
@@ -2605,6 +2699,30 @@ interface GraphQlIssue extends GraphQlDigestNode {
 }
 
 /** The one-PR closing-issues query — see {@link GitHubClient.listPullRequestClosingIssues}. */
+interface GraphQlAuthor {
+  __typename?: string | null;
+  login?: string | null;
+}
+
+interface GraphQlPrDiscussion {
+  repository?: {
+    pullRequest?: {
+      reviews?: { nodes?: Array<{ author?: GraphQlAuthor | null; state?: string | null; body?: string | null; submittedAt?: string | null } | null> | null } | null;
+      reviewThreads?: {
+        pageInfo?: { hasNextPage?: boolean | null } | null;
+        nodes?: Array<{
+          path?: string | null;
+          line?: number | null;
+          isResolved?: boolean | null;
+          isOutdated?: boolean | null;
+          comments?: { nodes?: Array<{ author?: GraphQlAuthor | null; body?: string | null } | null> | null } | null;
+        } | null> | null;
+      } | null;
+      comments?: { nodes?: Array<{ author?: GraphQlAuthor | null; body?: string | null; createdAt?: string | null } | null> | null } | null;
+    } | null;
+  } | null;
+}
+
 interface GraphQlClosingIssues {
   repository?: {
     pullRequest?: {

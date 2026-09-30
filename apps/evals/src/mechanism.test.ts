@@ -821,10 +821,10 @@ describe("Arm seam — model-selection adapters (arm.ts)", () => {
 
         writeFileSync(
           join(overlay, "config.yaml"),
-          "models:\n  default: openai/gpt-5.4-mini\nreview:\n  postsCheck: true\n  analysis:\n    enabled: true\n    surveyPasses: 6\n",
+          "models:\n  default: openai/gpt-5.4-mini\nreview:\n  postsCheck: true\n  analysis:\n    enabled: true\n",
         );
         const arm = modelsArm("m", "f", overlay);
-        expect(arm.review).toEqual({ postsCheck: true, analysis: { enabled: true, surveyPasses: 6 } });
+        expect(arm.review).toEqual({ postsCheck: true, analysis: { enabled: true } });
         // Config arms read the same block from the same file.
         expect(configArm(root, overlay).review).toEqual(arm.review);
       } finally {
@@ -1312,6 +1312,15 @@ describe("PR context — core's own projection, not a copy", () => {
     expect(ctx.maxFlakyDeferrals).toBe(defaultFixConfig().maxFlakyDeferrals);
   });
 
+  it("projects the instance's base branch, with the case's pr_state winning", async () => {
+    // A `master`-based PR (sentry) read `"main"` here, and `baseBranch` from this
+    // projection overwrote the harness's own — post-review then diffed against
+    // an `origin/main` that does not exist and demoted every finding.
+    expect((await prContextPatch({ ...args, baseRef: "master" })).baseBranch).toBe("master");
+    expect((await prContextPatch({ ...args, baseRef: "master", seed: { base_ref: "develop" } })).baseBranch).toBe("develop");
+    expect((await prContextPatch(args)).baseBranch).toBe("main");
+  });
+
   it("projects the merge gate's verdict AND its reason, from one decision", async () => {
     const green = await prContextPatch({
       ...args,
@@ -1351,15 +1360,13 @@ describe("PR context — core's own projection, not a copy", () => {
     // stays off, with no per-case special-casing.
     const off = await prContextPatch({ ...args, review: { postsCheck: true } });
     expect(off.analysisEnabled).toBeUndefined();
-    expect(off.prBody).toBeUndefined();
 
     // wp3/config.yaml: the same block plus `analysis.enabled`.
     const on = await prContextPatch({
       ...args,
-      review: { postsCheck: true, analysis: { enabled: true, maxObligations: 40, surveyPasses: 6 } },
+      review: { postsCheck: true, analysis: { enabled: true, maxObligations: 40 } },
     });
     expect(on.analysisEnabled).toBe("true");
-    expect(on.prBody).toBe(args.body);
 
     // No arm policy at all is byte-identical to a policy that names no analysis.
     expect((await prContextPatch(args)).analysisEnabled).toBeUndefined();
@@ -1374,7 +1381,7 @@ describe("PR context — core's own projection, not a copy", () => {
   // obligations vanish and the branch spends a model call saying it cannot work.
   //
   // Both failures were silent in the sense that mattered: the run went green.
-  const withAnalysis = { enabled: true, maxObligations: 40, surveyPasses: 6 };
+  const withAnalysis = { enabled: true, maxObligations: 40 };
   const specBody = "### What & why\n\nCloses #1586.\n\n### Acceptance criteria\n\n- [ ] Silent login must not show the Google popup on a returning session\n";
 
   it("harness-derived changed files give the spec axis its second end", async () => {
@@ -1384,7 +1391,7 @@ describe("PR context — core's own projection, not a copy", () => {
       review: { analysis: withAnalysis },
       changedFiles: ["src/auth/redirect-sign-in.ts", "src/auth/session.ts"],
     });
-    const block = ctx.specObligations as string | undefined;
+    const block = ctx.specObligationsJson as string | undefined;
     expect(block).toBeDefined();
     // The obligation names both ends: the criterion verbatim, and a changed file.
     expect(block).toContain("Silent login must not show the Google popup");
@@ -1395,9 +1402,8 @@ describe("PR context — core's own projection, not a copy", () => {
   it("without them the axis degrades LOUDLY rather than silently passing", async () => {
     const ctx = await prContextPatch({ ...args, body: specBody, review: { analysis: withAnalysis } });
     // Locked decision 6: "could not look" and "looked and it is fine" are
-    // different facts, so the block still renders and says which.
-    expect(ctx.specObligations).toContain("changed-file list could not be read");
-    expect(ctx.specObligations).toContain("That is NOT a pass");
+    // different facts, so the set is still projected and says which.
+    expect(ctx.specObligationsJson).toContain("changed-file list could not be read");
   });
 
   it("a case seeding [] means 'changes nothing', not 'could not read'", async () => {
@@ -1410,8 +1416,8 @@ describe("PR context — core's own projection, not a copy", () => {
     });
     // The seed wins over the harness-derived set, and its degraded message is
     // the other one — a `||` fallback here would silently swap the two.
-    expect(ctx.specObligations).toContain("changes no files");
-    expect(ctx.specObligations).not.toContain("src/auth/session.ts");
+    expect(ctx.specObligationsJson).toContain("changes no files");
+    expect(ctx.specObligationsJson).not.toContain("src/auth/session.ts");
   });
 
   it("the arm wins over a case's own review seed — gold can never flip an arm", async () => {
@@ -1467,11 +1473,77 @@ describe("PR context — core's own projection, not a copy", () => {
         review: { analysis: withAnalysis },
         github: resolveReviewGitHubClient({ githubApiBaseUrl: fake.url }),
       });
-      const block = ctx.specObligations as string | undefined;
+      const block = ctx.specObligationsJson as string | undefined;
       expect(block).toBeDefined();
       expect(block).toContain("nearform.com domain server-side");
       expect(block).toContain("src/auth/session.ts");
       expect(block).not.toContain("changed-file list could not be read");
+    } finally {
+      await fake.close();
+    }
+  });
+
+  // `select`'s view of the PR's prior conversation, through the same production
+  // path: core's resolver → a real client → the fake's discussion query, served
+  // from the case's seeds. A resolved thread must read as resolved — it is the
+  // one fact REST cannot carry.
+  it("serves the prior discussion to core's resolver, resolution included", async () => {
+    const fake = await startFakeGitHub({
+      owner: "acme",
+      repo: "widgets",
+      pulls: [
+        {
+          number: 413,
+          title: "fix: cache ttl",
+          body: "Keeps the TTL at 120s.",
+          base_ref: "main",
+          head_ref: "fix/ttl",
+          base_commit: "a".repeat(40),
+          head_commit: "b".repeat(40),
+          reviews: [{ user: "alice", state: "CHANGES_REQUESTED", body: "TTL outlives the fetch." }],
+          review_comments: [
+            { user: "last-light[bot]", path: "src/cache.ts", line: 12, body: "Null deref on miss.", resolved: true },
+            { user: "bob", path: "src/cache.ts", line: 40, body: "Off by one?" },
+          ],
+          issue_comments: [{ user: "carol", body: "LGTM once CI is green" }],
+        },
+      ],
+    });
+    try {
+      fake.setPullFiles(413, [{ filename: "src/cache.ts", status: "modified", additions: 3, deletions: 1, changes: 4, sha: "c".repeat(40) }]);
+      const ctx = await prContextPatch({
+        repo: "acme/widgets",
+        prNumber: 413,
+        title: "fix: cache ttl",
+        body: "Keeps the TTL at 120s.",
+        branch: "fix/ttl",
+        review: { analysis: withAnalysis },
+        github: resolveReviewGitHubClient({ githubApiBaseUrl: fake.url }),
+      });
+      const block = String(ctx.priorDiscussion ?? "");
+      expect(block).toContain("@alice — CHANGES_REQUESTED: TTL outlives the fetch.");
+      expect(block).toContain("`src/cache.ts:12` [RESOLVED] @last-light (bot): Null deref on miss.");
+      expect(block).toContain("`src/cache.ts:40` [open] @bob: Off by one?");
+      expect(block).toContain("@carol: LGTM once CI is green");
+      // The investigators' side of the same projection.
+      expect(String(ctx.prIntent ?? "")).toContain("Keeps the TTL at 120s.");
+    } finally {
+      await fake.close();
+    }
+  });
+
+  // The common case — a Martian PR nobody has discussed — must answer EMPTY
+  // from the fake, not error: an error would read as "could not look" and log
+  // a read failure on every pr-review case.
+  it("answers the discussion query for an undiscussed PR with empty lists, not an error", async () => {
+    const fake = await startFakeGitHub({
+      owner: "acme",
+      repo: "widgets",
+      pulls: [{ number: 414, title: "t", body: "", base_ref: "main", head_ref: "x", base_commit: "a".repeat(40), head_commit: "b".repeat(40) }],
+    });
+    try {
+      const gh = resolveReviewGitHubClient({ githubApiBaseUrl: fake.url });
+      await expect(gh.getPullRequestDiscussion("acme", "widgets", 414)).resolves.toEqual({ reviews: [], threads: [], threadsTruncated: false, comments: [] });
     } finally {
       await fake.close();
     }

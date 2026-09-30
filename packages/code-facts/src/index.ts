@@ -72,9 +72,14 @@ export type {
 export {
   buildSyntacticIndex,
   extractFactsByName,
+  familyOf,
+  grammarDegraded,
   isIndexablePath,
   nameAmbiguityOf,
+  parsesOnDisk,
   scanChangedFiles,
+  scanDeclarations,
+  scanImportLines,
   scanImportSpecifiers,
   scanSource,
   unquote,
@@ -87,6 +92,7 @@ export type {
   DeclSite,
   ExtractFactsByNameOptions,
   ExtractFactsByNameResult,
+  GrammarFailure,
   LitSite,
   RefSite,
   ScanSink,
@@ -99,12 +105,21 @@ export {
   asSyntaxNode,
   descriptorById,
   descriptorForPath,
+  forceGrammarUnavailable,
+  grammarAvailable,
+  grammarStatus,
   interestingKinds,
   literalKindOf,
+  preflightLibrary,
   registeredExtensions,
   supportedKinds,
+  DYNAMIC_GRAMMARS,
+  GO_DESCRIPTOR,
+  JAVA_DESCRIPTOR,
   JAVASCRIPT_DESCRIPTOR,
   LANGUAGE_DESCRIPTORS,
+  PYTHON_DESCRIPTOR,
+  TSJS_FAMILY,
   TSJS_DESCRIPTORS,
   TSX_DESCRIPTOR,
   TYPESCRIPT_DESCRIPTOR,
@@ -112,6 +127,8 @@ export {
 export type {
   ConstantRule,
   DeclarationRule,
+  DynamicGrammar,
+  GrammarStatus,
   LanguageDescriptor,
   LiteralKinds,
   SyntaxNode,
@@ -243,7 +260,7 @@ export {
 } from "./prepare.js";
 export type { ExecFn, ExecResult, PackageManagerId, PrepareOptions } from "./prepare.js";
 
-export { hypothesisId, normalizeFamilyIds, readHypothesisSet, resolveHypothesis } from "./hypotheses.js";
+export { hypothesisId, normalizeFamilyIds, pathOfRow, readHypothesisSet, resolveHypothesis } from "./hypotheses.js";
 export type { NormalizeIdsResult } from "./hypotheses.js";
 /** The one JSONL reader — recovers pretty-printed rows; evals reads through it too. */
 export { parseJsonl } from "./jsonl.js";
@@ -266,6 +283,99 @@ export {
   transcriptRecordsCommand,
 } from "./probes.js";
 export type { CheckProbesOptions, CheckProbesResult, ProbeAnswer, ProbeGapKind, ProbeStrength, ProbeVerdict } from "./probes.js";
+/** Which hypotheses `falsify` probes — ranked, capped, and read by the gate, the prompt and the dossier alike. */
+export {
+  plannedProbe,
+  planProbes,
+  PROBE_PLAN_VERSION,
+  probePlanPath,
+  readProbePlan,
+  renderProbePlan,
+  renderProbePlanSummary,
+  writeProbePlan,
+  writeProbePlanFiles,
+} from "./probe-plan.js";
+export type { OwedReason, PlannedProbe, PlanSite, ProbePlan, WriteProbePlanResult } from "./probe-plan.js";
+/** Rows grouped into sites by anchor (path + line window, across families), ranked by support. */
+export {
+  clusterSites,
+  DEFAULT_SITE_WINDOW,
+  planProbeSites,
+  renderSiteBrief,
+  SITE_PLAN_VERSION,
+  siteLeads,
+} from "./site-cluster.js";
+export type {
+  ClusterOptions,
+  ProbeSite,
+  ProbeSitePlan,
+  Site,
+  SiteLead,
+  SiteLeads,
+  SitePlan,
+  SiteVoters,
+  VoterUnit,
+} from "./site-cluster.js";
+/** The `sites` review engine: site plan + briefs, the investigator gate, merge, selection gate, finalize. */
+export {
+  checkSelection,
+  checkSiteFindings,
+  checkSiteSlot,
+  DEFAULT_SITE_PLAN,
+  DUPLICATE_LINE_WINDOW,
+  fallbackSelection,
+  finalizeSiteFindings,
+  IMPORTANCES,
+  isExecutionCommand,
+  MAX_SITE_FINDINGS,
+  mergeSiteFindings,
+  nearestCodeLine,
+  noneChecksRequired,
+  planSiteSlots,
+  readSiteFindingLines,
+  readSiteMerge,
+  readSitePlan,
+  readVoterUnits,
+  renderEmptySlotBrief,
+  renderFinalize,
+  renderSelectionCheck,
+  renderSiteAssignment,
+  renderSiteCheck,
+  renderSiteMerge,
+  SITE_MERGE_EMPTY_MARKER,
+  renderSitePlanSummary,
+  selectedRel,
+  SITE_REVIEW_VERSION,
+  SITE_SLOTS,
+  SITE_STRENGTHS,
+  siteBriefRel,
+  siteFindingsRel,
+  siteIdForSlot,
+  siteScratchRel,
+  sitesRelDir,
+  writeSiteMerge,
+  writeSitePlan,
+} from "./site-review.js";
+export type {
+  FinalizeResult,
+  Importance,
+  NoneCheck,
+  PooledFinding,
+  SelectionCheck,
+  SelectionDocument,
+  SelectionGapKind,
+  SelectionItem,
+  SiteFinding,
+  SiteFindingLine,
+  SiteFindingsCheck,
+  SiteGap,
+  SiteGapKind,
+  SiteMerge,
+  SitePlanOptions,
+  SiteReviewPlan,
+  SiteSlot,
+  SiteStrength,
+} from "./site-review.js";
 /** Issue #405 — a posted finding's severity, derived from evidence + probe strength. ONE derivation for the pipeline (reconcile) and the evals. */
 export {
   buildSeverityIndex,
@@ -276,26 +386,12 @@ export {
 } from "./finding-severity.js";
 export type { RankEvidence, SeverityIndex, StampSeverityResult } from "./finding-severity.js";
 
-export { buildEntries, locateExcerpt, pathOfRow, renderAdjudicationDossier } from "./adjudicate-render.js";
-export type { DossierEntries, DossierEntry, DossierOptions, DossierQuote, ExcerptLocation } from "./adjudicate-render.js";
-
-export { classifyHypotheses, jevClassifyPath, readJevClassifyDocument, writeJevClassifyDocument } from "./jev-classify.js";
-export type { JevClassifyDocument, JevClassifyOptions, JevResult } from "./jev-classify.js";
-
-export {
-  buildFindingsLedger,
-  checkFindings,
-  renderFindingsCheck,
-  renderFindingsLedger,
-  titleFrom,
-} from "./findings.js";
+export { checkFindings, renderFindingsCheck, titleFrom } from "./findings.js";
 export type {
   CheckFindingsOptions,
   CheckFindingsResult,
   FindingsGap,
   FindingsGapKind,
-  FindingsLedger,
-  LedgerEntry,
   RepairAction,
 } from "./findings.js";
 
@@ -317,3 +413,45 @@ export type { LoggerPort } from "./log.js";
 export * from "./schema.js";
 
 export { deriveVerdict, effectiveTrigger, hasEvidence, isBehaviouralClaim, severityOf, needsProbeOf, isReassurance, probeReasonOf, type ProbeReason, type SurveyEvidence, type SurveyVerdict, type Discharge, type Severity } from "./survey-verdict.js";
+
+/** The unit survey (docs/plans/pr-review-units-sites.md) — the assembler, the reply schema, the ingest. */
+export {
+  buildUnits,
+  buildUnitsOrEmpty,
+  emptyUnitsDocument,
+  functionLikes,
+  parsePatchLines,
+  DEFAULT_MAX_REQUEST_CHARS,
+  DEFAULT_MAX_UNITS,
+  MAX_NEIGHBOURS,
+  SMALL_SYMBOL_LINES,
+  UNITS_PROMPT_VERSION,
+  UnitKindSchema,
+  UnitSchema,
+  UnitsDocumentSchema,
+  FullUnitsDocumentSchema,
+  FallbackUnitsDocumentSchema,
+  SpecObligationSchema,
+  SpecObligationSetSchema,
+  fallbackUnitsDocument,
+  parseUnitsDocument,
+  NOTHING_TO_SURVEY,
+} from "./units.js";
+export type { AnyUnitsDocument, BuildUnitsOptions, BuildUnitsResult, FallbackUnitsDocument, Unit, UnitKind, UnitsDocument } from "./units.js";
+export { FAMILY_QUESTIONS, lineTag, renderUnitRequest, renderUnitSpecific, requestLineTags, UNIT_SEPARATOR, UNITS_SHARED_PREFIX } from "./units-render.js";
+export type { RequestModel, SpecUnitObligation, TaggedLine } from "./units-render.js";
+export {
+  findUnitObject,
+  isUsableUnitReply,
+  locateUnitObject,
+  UNIT_FAMILIES,
+  unitResponseJsonSchema,
+  UnitAnswerSchema,
+  UnitDefectSchema,
+  UnitEvidenceSchema,
+  UnitResponseBodySchema,
+  UnitResponseFileSchema,
+} from "./unit-response.js";
+export type { UnitAnswer, UnitDefect, UnitEvidence, UnitFamily, UnitObjectVia, UnitResponseBody, UnitResponseFile } from "./unit-response.js";
+export { ingestUnits, renderIngest } from "./units-ingest.js";
+export type { DemotedEntry, DemotionReason, IngestDocument, IngestUnitsOptions, IngestUnitsResult, UnitIngestReport, UnitIngestStatus } from "./units-ingest.js";

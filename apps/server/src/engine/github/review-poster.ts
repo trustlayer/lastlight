@@ -48,6 +48,13 @@ export interface ReviewFinding {
    */
   existingCode?: string;
   /**
+   * The range's end line, set by `sites --finalize` for every site finding
+   * with a `startLine`. When the multi-line `existingCode` does not match
+   * inside one hunk, the finding is resolved as if it had no range at all —
+   * see step 1b of {@link resolveAnchor}.
+   */
+  anchorLine?: string;
+  /**
    * The obligation family this came from (WP6b).
    *
    * It keyed the per-family confidence threshold until that bar was removed —
@@ -83,9 +90,19 @@ export interface ReviewFinding {
    */
   tier?: "inline" | "body" | "internal";
   /**
-   * #399's typed attributes, written INSTEAD of `tier` under
-   * `review.analysis.adjudicate: "dossier"`. {@link computeTier} turns them
-   * into a tier; absent, everything below behaves exactly as it did.
+   * The selection's importance (`must-fix` / `worth-mentioning` / `nit`), and
+   * — on a re-review — who already raised this point and where. Written by
+   * `sites --finalize`; an `alreadyRaised` finding is recorded `internal`,
+   * never re-posted, but it is still OPEN, so the summary must not call the PR
+   * good to merge over it.
+   */
+  importance?: string;
+  alreadyRaised?: string;
+  /**
+   * #399's typed attributes, written INSTEAD of `tier` (by the removed
+   * adjudicator's `dossier` mode; `site-finalize` writes a `category`).
+   * {@link computeTier} turns them into a tier; absent, everything below
+   * behaves exactly as it did.
    *
    * `claim` is what is WRONG (not what the code does), `fix` is what to
    * change, and `category` is the axis that measured **AUC 0.897** where
@@ -230,6 +247,15 @@ export interface ReviewFindingsDoc {
    * inertness is structural rather than a promise about what a prompt says.
    */
   verdict?: SplitVerdict;
+  /**
+   * Set when this document is NOT a review anybody wrote: `lastlight-facts
+   * findings --repair` creates findings.json when the adjudicator never did
+   * (every hypothesis at `internal`, `event: COMMENT`, a summary saying the
+   * change was not assessed). `post-review` then posts that summary and the
+   * reason, never a summary written from the (empty) posted set — which reads
+   * "No issues to raise." and would call an unassessed PR clean.
+   */
+  incomplete?: { phase?: string; reason?: string };
 }
 
 /** An inline review comment in the shape GitHub's create-review API expects. */
@@ -495,7 +521,7 @@ function resolutionOf(
  *
  * | # | Step | Model? |
  * |---|---|---|
- * | 1 | Match the excerpt against the file's own hunks — new side, then old side | no |
+ * | 1 | Match the excerpt against the file's own hunks — new side, then old side (a range that misses re-resolves as its single `anchorLine`) | no |
  * | 2 | Scan the full head-side file content | no |
  * | 3 | Relocate across files: a **unique** hit anywhere in the diff re-files the finding | no |
  * | 4 | Ask a model to regenerate the excerpt and retry step 1 | yes |
@@ -538,6 +564,19 @@ export function resolveAnchor(
       const run = nearest(runs, f.line);
       if (run) return resolutionOf(f.path, side, run, "hunk");
     }
+  }
+
+  // Step 1b — a RANGE that did not fit inside one of its file's hunks is
+  // resolved exactly as the range-less finding would be: the whole cascade
+  // again on its single end line (`anchorLine`), including the rule that an
+  // end line too short to be evidence (`}`, `);`) leaves the model's own line
+  // standing. A range never reaches steps 2–3 as a range — step 2 could pair
+  // a start and end from DIFFERENT hunks, a comment GitHub 422s, which fails
+  // the whole review to body-only. So asking for a range can only ever add a
+  // `start_line`, never cost a finding the placement it would have had.
+  if (f.anchorLine !== undefined && needle.length > 1) {
+    const single = f.anchorLine.trim().length >= 4 ? f.anchorLine : undefined;
+    return resolveAnchor({ ...f, existingCode: single, anchorLine: undefined }, files, readHeadFile);
   }
 
   // Step 2 — the whole head-side file. Covers an excerpt that sits outside any
@@ -694,6 +733,9 @@ export function splitFindings(
  * `below-threshold` was a fourth, retired with the per-family confidence bars
  * it named — see {@link rankOf} for the measurement.
  */
+// `adjudicated` means "the findings document chose this tier itself" — named
+// for the removed adjudicator that wrote it, and kept because it is persisted
+// in `disposition.json` and the eval archives are read by it.
 export type DemotionReason = "off-diff" | "overflow" | "adjudicated";
 
 /** One demoted finding, carrying the reason it did not earn an inline comment. */
@@ -840,9 +882,9 @@ const SEVERITY_WEIGHT: Record<string, number> = {
  * "Enforcement check passed: LOGIN_HINT_STORAGE_KEY" — 21 rows tied at the
  * maximum rank of 3.00, 11 of them verification reports.
  *
- * `review-adjudicate.md` already tells the model to price the defect and not its
- * own certainty, and warns that confidences which do not spread have disabled
- * the thresholds. The instruction does not take, and this is what it cost.
+ * The (since removed) `review-adjudicate.md` told the model to price the defect
+ * and not its own certainty, and warned that confidences which do not spread
+ * disable the thresholds. The instruction did not take, and this is what it cost.
  *
  * **Severity stays** — at 0.521 with a CI straddling 0.500 it is indistinguishable
  * from neutral, so it is not carrying the rank but it is not poisoning it either,

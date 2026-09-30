@@ -189,7 +189,8 @@ router routed nine, which is why the dashboard showed no Slack trigger for
 {
   name: string;                         // unique within workflow
   label?: string;                       // dashboard display
-  type?: "context" | "agent" | "bash" | "script";  // default "agent"
+  type?: "context" | "agent" | "bash" | "script"   // default "agent"
+        | "fanout" | "post-review" | "survey-units";  // these three run via app-registered handlers
   prompt?: string;                      // path to template, e.g. "prompts/architect.md"
   command?: string;                     // type: bash — deterministic shell command (templated)
   script?: string;                      // type: script — inline source (templated)
@@ -206,12 +207,14 @@ router routed nine, which is why the dashboard showed no Slack trigger for
   depends_on?: string[];                // declaring this ANYWHERE disables chain synthesis for the WHOLE workflow
   trigger_rule?:
     | "all_success" | "one_success"     // DAG firing conditions
-    | "none_failed_min_one_success"
+    | "none_failed"                     // no dep FAILED — an all-skipped set passes
+    | "none_failed_min_one_success"     // no dep failed AND at least one succeeded
     | "all_done";
   branches?: FanoutBranch[];            // type: fanout only — required there, rejected elsewhere
   max_concurrent?: number | { from: string; default: number };  // fanout width, clamped by the backend ceiling
   on_branch_soft_failure?: { retries: number; then: "fail" | "complete" };  // per-BRANCH; not generic_loop's key
   on_branch_gate_failure?: { retries: 0 | 1 };  // fanout only — re-run a branch whose until_bash said no, once
+  skip_satisfied_branches?: boolean;    // fanout only — run each until_bash first; a branch whose gate already closes starts no session
   output_var?: string;                  // alias for {{this.field}} in later phases
   unrestricted_egress?: boolean;        // bypass strict allowlist for this phase
   web_search?: boolean;                 // enable agentic-pi web tools
@@ -253,13 +256,15 @@ Defined with Zod; loaded and cached by `loader.ts`.
 
 ## Phase types
 
-Six: `context` (no execution), `agent` (one LLM session), `fanout`
+Seven: `context` (no execution), `agent` (one LLM session), `fanout`
 (N LLM sessions, concurrently, in one workspace), the deterministic
-`bash` / `script` pair (a command, no LLM), and `post-review`
-(in-process PR-review submission, no sandbox).
+`bash` / `script` pair (a command, no LLM), `post-review`
+(in-process PR-review submission, no sandbox), and `survey-units`
+(in-process per-unit review survey: one bounded model call per unit, no
+sandbox, no agent).
 
-The engine owns only the generic kinds. `post-review` and any other
-app-specific type are dispatched through a `Map<string,
+The engine owns only the generic kinds. `post-review`, `survey-units` and any
+other app-specific type are dispatched through a `Map<string,
 PhaseTypeHandler>` injected on `EnginePorts.handlers`
 (`phase-executor.ts`, registered in `runner.ts`) — which is the seam to
 extend when a deployment needs a step the engine should not know about.
@@ -345,26 +350,54 @@ extend when a deployment needs a step the engine should not know about.
   the field entirely unless `review.analysis.enabled` — so the inertness is
   structural rather than a promise about what a prompt writes.
 
+  A document may also be marked **`incomplete: { phase, reason }`** — the
+  conservation floor (`lastlight-facts findings --repair`, in `reconcile`)
+  writes one when no earlier phase produced `findings.json` but hypotheses
+  exist. The handler never posts such a document as a clean review:
+  it posts the document's own not-assessed summary plus the reason, on every
+  posting branch.
+- **survey-units** — the per-unit review survey
+  (`src/workflows/handlers/survey-units.ts`), the survey of the evidence
+  pipeline (`review.analysis.enabled`). Runs on the harness, with no
+  sandbox and no agent: it reads `.lastlight/pr-review/units.json` (written by
+  the preceding `units` bash phase, `lastlight-facts units`) from the host
+  checkout and makes **one bounded, non-agentic model call per unit** — `prompt:`
+  (required by the schema) as the system prompt, the unit's pre-rendered request
+  as the user message — up to `review.analysis.surveyUnitConcurrency` at once,
+  all under one whole-phase deadline (`timeout_seconds`, from
+  `surveyUnitsTimeoutSeconds`). Each reply is written back to the workspace for
+  `units-ingest`; replies are cached under
+  `<stateDir>/unit-survey-cache/<owner>/<repo>/`. The phase writes one virtual
+  transcript (so it reads like an agent session in the dashboard) and, unlike
+  `post-review`, an `executions` row with its cost. It **succeeds on every path
+  inside the phase** — no units, every call failing, the deadline — because
+  `units-ingest` records each unanswered obligation. Needing a host-readable
+  workspace, `review.analysis.enabled` is refused at config load on
+  `kubernetes`. See
+  [Configuration](/spec/02-configuration) and `docs/plans/pr-review-units-sites.md`.
+
 ### `fanout` — N agent sessions, one workspace
 
 ```yaml
-- name: survey
+- name: site-review
   type: fanout
-  depends_on: [seed]
+  prompt: prompts/review-site.md
+  depends_on: [site-plan]
   trigger_rule: all_done
-  skills: [survey-pass]
-  model: "{{models.review-survey}}"
-  max_concurrent: { from: surveyConcurrency, default: 6 }
+  model: "{{#if models.review-site}}{{models.review-site}}{{/if}}{{#if !models.review-site}}{{models.review-survey}}{{/if}}"
+  max_concurrent: { from: siteConcurrency, default: 6 }
   on_branch_soft_failure: { retries: 1, then: complete }
   on_branch_gate_failure: { retries: 1 }
+  skip_satisfied_branches: true
   branches:
-    - name: contract
-      prompt: prompts/survey-contract.md
-      context_file: .lastlight/pr-review/obligations/contract.md
-      until_bash: lastlight-facts discharge --dir .lastlight/pr-review --family contract
-    - name: security
-      prompt: prompts/survey-security.md
-      context_file: .lastlight/pr-review/obligations/security.md
+    - name: site-001
+      context_file: .lastlight/pr-review/sites/site-001.md
+      until_bash: lastlight-facts sites --check site-001 --dir .lastlight/pr-review --repo .
+    - name: site-002
+      context_file: .lastlight/pr-review/sites/site-002.md
+      until_bash: lastlight-facts sites --check site-002 --dir .lastlight/pr-review --repo .
+    # … site-008; then site-009 … site-016, each with
+    #   model: "{{models.review-site-pair}}"
 ```
 
 Each branch inherits the phase's `prompt` / `skills` / `model` /
@@ -375,26 +408,21 @@ the reserved `-retry` / `-check` / `-regate` suffixes.
 
 **A branch's `skills` REPLACES the phase's — it does not union with it**
 (`branchPhase()` in `handlers/fanout.ts`), so an override has to re-list
-everything it still wants. `pr-review.yaml` no longer uses one: the fan-out
-stages the single `survey-pass` skill on every branch, and the family's
-question lives in its prompt. That is LD9 — specialists separated by *question*,
-not by tool access — and it is also what keeps the shared prompt head
-byte-identical across the five branches, so they share one provider-side cached
-prefix. The `security` branch used to override with a third skill and voided
-that for itself.
+everything it still wants. `pr-review.yaml` uses none: every branch shares one
+prompt head, byte-identical, so the branches share one provider-side cached
+prefix, and what differs per branch arrives last, as its `context_file`.
 
-(The `model:` line above is why `pr-review.yaml`'s downstream `adjudicate`
-phase carries its own key the guarded way —
-`model: "{{#if models.review-adjudicate}}{{models.review-adjudicate}}{{/if}}{{#if !models.review-adjudicate}}{{models.review}}{{/if}}"`.
-The `{{#if}}` pair is load-bearing: a bare unset key renders *empty*, and an
-empty `model:` resolves to the **default** model — not to `models.review`,
-which is the fallback the phase actually wants.)
+(The `{{#if}}` pair in the `model:` line above is load-bearing: a bare unset
+`{{models.review-site}}` renders *empty*, and an empty `model:` resolves to the
+**default** model — not to `models.review-survey`, which is the fallback the
+phase actually wants.)
 
 **`context_file` — a path in a prompt is not a path.** A branch may name a
 workspace file, relative to the AGENT'S OWN CWD, whose contents the harness
 reads and appends to that branch's rendered prompt. The model never resolves
 it. This exists because it was measured: across three stored `pr-review` runs
-on 2026-08-22, 27 of 133 attempts to open the per-family obligations block
+on 2026-08-22 (the since-removed agent survey fan-out), 27 of 133 attempts to
+open the per-family obligations block
 resolved against the workspace ROOT rather than the checkout and hit ENOENT
 (23 of 120 branches never recovered), while all 98 relative reads succeeded.
 The model's only absolute anchor by its first turn is its skill bundle at
@@ -409,6 +437,21 @@ naming it, never silence: "nobody looked" must never render as "looked, found
 none". The one carve-out is **`kubernetes`**, whose `hostAgentCwd` is an in-pod
 path this process cannot see at all — there the read is not attempted and the
 branch is handed the path to open itself, with the mis-anchoring trap named.
+
+`site-review` (see [Configuration](/spec/02-configuration)) is the case
+`context_file` makes possible: sixteen **static** branches (`site-001` … `site-016`) share one
+slot-generic prompt (`prompts/review-site.md`), and everything that differs per
+branch — the site, its id, its output file — arrives in the brief the
+preceding `site-plan` bash phase wrote for that slot. Slots 1–8 are the ranked
+sites (`review.analysis.siteTop` of them used); slots 9–16 re-investigate
+ranks 1–8 on `models.review-site-pair`, and are used only when that key is set.
+`site-plan` writes every unused slot's `empty` line itself — the one line its
+gate (`lastlight-facts sites --check <site-id>`) accepts — and
+**`skip_satisfied_branches: true`** runs each branch's `until_bash` before any
+agent starts, so a branch whose gate already closes is reported done (like a
+resume dedup) and starts no session. The pre-gates run one at a time, before
+the pool; a branch with no `until_bash` always runs. Without the key, a PR with
+two sites would pay for fourteen agents each writing one line.
 
 **Why one node instead of N parallel phases.** Real DAG concurrency is
 parked behind four hard blockers, and
@@ -426,7 +469,12 @@ one `current_phase`, one artifact harvest, one dispose.
    The bundle is already keyed per phase so concurrent readers cannot
    collide; staging is filesystem work and is serialised rather than
    reasoned about.
-3. Branches run through a bounded `mapPool`.
+3. Branches run through a bounded `mapPool`. A branch that died on a
+   **provider error** (`stopReason: error_agent` — the agent loop caught a
+   failed model call, a 404/5xx/rate limit, not a crash or a kill) is
+   re-run once, whatever `on_branch_soft_failure` says, as
+   `<phase>_branch_<name>_retry`; at ten or sixteen concurrent sessions
+   per PR it is the common branch failure.
 4. **`until_bash` gates run after the join, sequentially.**
    `InProcessSandbox.runCommand` is a `spawnSync` — it blocks the event
    loop — so interleaving a gate with the agent turns would serialise
@@ -447,17 +495,28 @@ one `current_phase`, one artifact harvest, one dispose.
    that hard-failed, and a branch deduped on resume are never re-run. A
    re-run that fails leaves the first attempt's result standing. Absent
    the key the gate stays purely observational — every fan-out's
-   behaviour before it existed. `pr-review`'s `survey` declares it,
-   because an observational gate let a half-done hypotheses file (2 of
-   12 seeded checks answered) go downstream as if complete.
+   behaviour before it existed. `pr-review`'s `site-review` declares it
+   (it was introduced on the since-removed survey fan-out, where an
+   observational gate let a half-done hypotheses file — 2 of 12 seeded
+   checks answered — go downstream as if complete).
 6. One harvest, one dispose.
+
+**The fan-out's verdict, and the workflow's.** The node fails only when
+every branch failed. Otherwise it succeeds, and each failed branch row
+keeps `success: false` but carries **`tolerated: true`** — the scheduler
+counts a tolerated row as visible, not as a workflow failure. Before it,
+one site investigator's provider 404 marked a `pr-review` run `failed`
+after the review had posted, and a failed run leaves the head unassessed
+(`assessedHeadShaByWorkflow` counts succeeded runs only), so the review
+sweep re-dispatched a full review.
 
 **Concurrency is `min(max_concurrent, backend ceiling)`**, and the
 clamp is logged when the host has the last word:
 
 | backend | ceiling | why |
 |---|---:|---|
-| `none`, `docker` | 6 | in-process `run()`, or N `docker exec` into the one provisioned container |
+| `none` | 16 | in-process `run()`; 16 is the widest static fan-out (`site-review`, top 8 paired) |
+| `docker` | 6 | N `docker exec` into the one provisioned container — the production backend, memory-capped |
 | `gondolin`, `smol`, `kubernetes` | **1** | a QEMU micro-VM (or equivalent) per branch, in the harness process |
 
 A ceiling of 1 runs the branches as a chain — byte-identical in
@@ -887,7 +946,11 @@ approval resumes it. For each `running` run:
 1. Increment `restart_count`. If `> 3` (`MAX_RESTART_RESUMES`), mark
    the run `failed` and skip. This is the crash-loop circuit breaker.
 2. Mark stale execution rows failed.
-3. Call `resumeSimpleRun()` in the background (non-blocking).
+3. Call `resumeSimpleRun()` in the background (non-blocking). It rebuilds
+   the template context from the row: resume's own fields (bare `repo`,
+   taskId, branch, refreshed issue, effective models) over the dispatch's
+   persisted context (`restoredDispatchContext`), so a resumed or
+   admitted pr-review keeps `analysisEnabled` and its PR snapshot.
 
 **Approval / reply gate resume** — `simple.ts:317–397` handles inbound
 approval responses. Fetches the `workflow_approvals` row, updates its
@@ -1025,6 +1088,9 @@ A custom mini-DSL (not `eval()`). Accepts:
   context (`output` is the degenerate one-segment case). Strings and
   numbers only: stringifying an object yields `"[object Object]"`, which
   is a substring match waiting to surprise someone
+- `a.b.c.startsWith('text')` — an anchored match (leading whitespace
+  ignored), for a marker a tool prints as its first line; `contains` cannot
+  tell it from the same text quoted later in the output
 - `variable == 'value'` / `variable != 'value'` — equality / inequality
 - `variable == true` / `== false` — boolean coercion of bare literals
 - Dotted keys for nested access: `scratch.socratic.ready == true`
@@ -1038,6 +1104,11 @@ returns the **first matching expression**, so the scheduler can name it in
 the skip reason. The longer dotted path exists for `skip_if`, which needs
 to read a *sibling* value (`scratch.fixMarkers.diagnosis.class == '…'`)
 that the loop never did.
+
+The cancel check is that `getRun` at the top of every scheduler iteration:
+a `cancelled` row stops the run at the next phase boundary. It holds because
+a cancel is final — `finishRun` refuses to move a `cancelled` row, so the
+`failWorkflow` a killed phase triggers cannot overwrite it with `failed`.
 
 `runScope.scratch` is refreshed from the run row on each iteration, inside
 the `getRun` the cancel check already makes — so a guard reading `scratch`
@@ -1213,8 +1284,9 @@ command_policy:
   guard, not a security boundary: `sh -c "$(…)"` or a script under another name
   gets past it.
 
-`pr-review.yaml` sets `survey` and `adjudicate` to `install: block, test:
-block, host: block`, and `review` and `falsify` set `host` to `block` and
+`pr-review.yaml` sets `site-review` and `select` to `install: block, test:
+block, host: block` (`site-review`'s `install-scratch` follows the probe mode,
+`block` when probes are off), and `review` and `falsify` set `host` to `block` and
 `log` respectively (falsify moves to `block` once an eval arm's log shows
 nothing legitimate is caught). `review` blocks `test` always and `install` only when
 `review.analysis.enabled` (context key `reviewInstallPolicy`; with the pipeline
@@ -1274,7 +1346,9 @@ blocks `install` in every mode and reads `test` / `install-scratch` from
 - **A skipped node is not `succeeded`.** So an `all_success`
   `trigger_rule` downstream of a gated phase will not fire. That caveat
   is identical for all three gates; a graph that must proceed past one
-  needs `all_done` or `none_failed_min_one_success`.
+  needs `all_done`, `none_failed` (proceed unless a dep genuinely failed,
+  even when every dep skipped) or `none_failed_min_one_success` (the same,
+  but at least one dep must have succeeded).
 - **A run's config is frozen at dispatch.** `runWorkflow` takes the target
   repo's `.lastlight/` layer as a trailing, *defaulted* parameter (defaulted so
   `runWorkflow.length` stays 9 — the frozen `lastlight/evals` surface pinned by
@@ -1308,7 +1382,7 @@ the database stays app-side, behind a port.
 | Public entry | `src/workflows/simple.ts` |
 | The one scheduler (DAG walk, node status, wrap-up) | `packages/workflow-engine/src/core/scheduler.ts` |
 | Per-phase bodies (context / agent / loops / gates) | `packages/workflow-engine/src/core/phase-executor.ts` |
-| App-registered phase types | `src/workflows/handlers/{post-review,fanout}.ts`, registered in `runner.ts` |
+| App-registered phase types | `src/workflows/handlers/{post-review,fanout,survey-units}.ts`, registered in `runner.ts` |
 | Composition root (real ports: sandbox, state, GitHub) | `src/workflows/runner.ts` |
 | YAML schema (Zod) | `packages/workflow-engine/src/core/schema.ts` |
 | YAML loader + caching | `src/workflows/loader.ts` |

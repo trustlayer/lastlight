@@ -217,7 +217,7 @@ Phase kinds the runner recognises:
   skill bundle, and gets its own `executions` row under
   `<phase>_branch_<name>` — which is what preserves resume, dedup,
   per-branch cost and the dashboard's longest-prefix grouping.
-  `max_concurrent` is clamped by a backend ceiling (`none`/`docker` 6;
+  `max_concurrent` is clamped by a backend ceiling (`none` 16, `docker` 6;
   `gondolin`/`smol`/`kubernetes` **1**, because each branch would be a
   micro-VM in the harness process). A ceiling of 1 runs them as a chain,
   byte-identical to declaring sequential phases. Branch `until_bash`
@@ -226,9 +226,18 @@ Phase kinds the runner recognises:
   loop, so interleaving would serialise the whole fan-out on the one
   backend it exists to speed up. They are observational unless the phase
   declares `on_branch_gate_failure: { retries: 1 }` (the `pr-review`
-  survey does): then a branch whose gate ran and said no is re-run once
+  `site-review` fan-out does): then a branch whose gate ran and said no is re-run once
   (`_regate` row) with the gate's output appended to its prompt, and
-  gated again. No `approval_gate` (a fan-out cannot
+  gated again. **`skip_satisfied_branches: true`** runs each branch's
+  gate once BEFORE the pool, sequentially: a branch whose gate already
+  closes is reported done and starts no session (`site-review` declares
+  16 branches, and `sites --plan` writes every unused slot's `empty`
+  line). A branch that died on a provider error (`error_agent`) is
+  re-run once regardless of the soft policy. The node fails only when
+  every branch failed; otherwise its failed branch rows carry
+  `tolerated: true`, which the scheduler does not count against the
+  workflow (a failed pr-review run leaves the head unassessed, and the
+  review sweep re-dispatches it). No `approval_gate` (a fan-out cannot
   pause mid-flight) and no `loop:`/`generic_loop:` (the branches are the
   iteration shape). Isolation is by **disjoint output paths**, not
   separate checkouts. A branch may also declare **`context_file`** — a
@@ -240,6 +249,23 @@ Phase kinds the runner recognises:
   host end of the `cwd` a `type: bash` phase runs in — and an unreadable
   path appends a loud NOT AVAILABLE notice rather than nothing. See
   `spec/06-workflow-engine.md` → "`fanout`".
+- **survey-units** (`type: survey-units`) — the per-unit review survey of
+  the `review.analysis` evidence pipeline (refused at boot on kubernetes,
+  which has no host checkout). Handler: `handlers/survey-units.ts`, registered on
+  `EnginePorts.handlers` in `runner.ts` like `post-review`/`fanout`. Runs
+  **in the harness process — no sandbox, no agent**: reads
+  `.lastlight/pr-review/units.json` (from the preceding `units` bash phase)
+  out of the host checkout and makes ONE bounded, non-agentic model call per
+  unit — `prompt:` (schema-required) as the system prompt, the unit's
+  pre-rendered request as the user message — `surveyUnitConcurrency` at a
+  time under one whole-phase deadline (`timeout_seconds`). Replies go back
+  into the workspace for `units-ingest`, and into a reply cache under
+  `<stateDir>/unit-survey-cache/<owner>/<repo>/`. It writes one virtual
+  transcript through `AgenticShim` and an `executions` row (cost included),
+  and it **succeeds on every path inside the phase** — `units-ingest`
+  records every unanswered obligation. Needs a host-readable workspace
+  (`handlers/host-repo-dir.ts`), so config load refuses the engine on
+  `kubernetes`. See `docs/plans/pr-review-units-sites.md`.
 - **loop-phase** — any phase with `loop:` set. Always executes as an
   agent phase internally, but repeated in `reviewer → fix → reviewer`
   pairs up to `max_cycles`. See loop iteration naming below.
@@ -469,8 +495,10 @@ types" above.
   `ctx.taskId`. The sandbox workspace persists between phases (architect writes
   `plan.md`, executor reads it). The old DAG path's per-phase
   `${taskId}-${phaseName}` clones are gone.
-- **Uniform skip semantics.** A node runs iff its trigger rule is satisfied by
-  its deps' statuses; otherwise it is skipped (no downstream agent calls; the
+- **Uniform skip semantics.** A node runs iff its trigger rule (`all_success`
+  default, `one_success`, `none_failed`, `none_failed_min_one_success`,
+  `all_done`) is satisfied by its deps' statuses — `none_failed` is the one
+  that passes when every dep was skipped; otherwise it is skipped (no downstream agent calls; the
   run ends `success: false`). `isTerminated` errors (OOM/cancel) are not
   reported as phase failures, and the failing node's error propagates to the
   run.
@@ -632,7 +660,13 @@ ${repo}-${issueNumber}-${workflowName}-${runId.slice(0, 8)}
   per-phase `${taskId}-${phaseName}` clones are gone.
 
 `resume.ts` reconstructs the taskId from the stored `context.taskId` so
-a resumed run lands in the same sandbox dir the original started in.
+a resumed run lands in the same sandbox dir the original started in. It also
+restores the dispatch's whole template context from the row
+(`restoredDispatchContext` — everything but the keys resume owns: bare `repo`,
+taskId, branch, models, …). Every resume path needs it — boot recovery,
+Retry, and an **admission promotion** of a run created `queued` at the cap: a
+pr-review that lost `analysisEnabled` skipped all its analysis phases and
+posted the light review instead.
 
 **Per-PR reuse exception (issue #107).** A workflow declaring
 `workspace: per-target-reuse` (`pr-review`, `pr-fix`, `dependabot-ci-fix`,

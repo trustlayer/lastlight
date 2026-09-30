@@ -45,13 +45,16 @@ import type {
 import { makePostReviewHandler } from "./handlers/post-review.js";
 import {
   REVIEW_TRIAGE_SCRATCH_KEY,
+  reviewTriageSeed,
   type ReviewTriageScratch,
 } from "../engine/review-triage.js";
 import { makeFanoutHandler } from "./handlers/fanout.js";
+import { makeSurveyUnitsHandler } from "./handlers/survey-units.js";
 import { fileVerdictReader } from "./handlers/verdict-reader.js";
 import { QuotaExceededError } from "../sandbox/k8s/quota.js";
 import type { ProgressReporter } from "../notify/types.js";
 import { collapseDetail } from "../notify/render.js";
+import { markRunLive } from "./live-runs.js";
 
 // `isTerminated` used to live here; re-exported for API stability.
 export { isTerminated };
@@ -307,14 +310,15 @@ const RUN_SPAN_NAME = "lastlight.workflow.run";
  * ABSENT. An absent value in a `skip_if` coerces to false, so
  * `scratch.reviewTriage.depth == 'light'` would not match — which is the safe
  * direction for the pipeline phases — but `prompts/review.md` chooses between
- * three mutually exclusive `{{#if}}` arms, and with none of the three keys set
- * it would render NO brief at all. Seeding is what makes "exactly one arm" true
- * by construction rather than by the triage phase having run.
+ * two mutually exclusive `{{#if}}` arms, and with neither key set it would
+ * render NO brief at all. Seeding is what makes "exactly one arm" true by
+ * construction rather than by the triage phase having run.
  *
- * `deep` / `baseline` mirror today's two arms: the pipeline has already run, or
- * it has not. `harvestReviewTriage` replaces the whole namespace with
+ * `harvestReviewTriage` replaces the whole namespace with
  * `{ depth: "light", light: true }` when the triage phase asks for a single
- * pass, which is what clears the other two.
+ * pass, which is what clears `baseline` — and `skipReview`, the flag that
+ * skips the `review` phase when the pipeline is on. A light review therefore
+ * always runs it.
  *
  * Scoped to REVIEW-SHAPED workflows by the structural fact rather than by name:
  * a workflow that declares a `post-review` phase is one that posts a review, so
@@ -337,14 +341,10 @@ async function seedReviewTriage(
 ): Promise<void> {
   const posts = definition.phases.some((p) => p.type === "post-review");
   if (!posts || scratch[REVIEW_TRIAGE_SCRATCH_KEY]) return;
-  // The same projection the phases gate on, read the same way: the render
-  // context carries the literal string "true".
-  const analysisEnabled = ctx.analysisEnabled === "true" || ctx.analysisEnabled === true;
-  const seed: ReviewTriageScratch = {
-    depth: "full",
-    deep: analysisEnabled,
-    baseline: !analysisEnabled,
-  };
+  // The same projections the phases gate on, read the same way: the render
+  // context carries the literal string "true". `skipReview` rides the seed
+  // (see `reviewTriageSeed`) so the light harvest's replacement clears it.
+  const seed: ReviewTriageScratch = reviewTriageSeed(ctx as unknown as Record<string, unknown>);
   scratch[REVIEW_TRIAGE_SCRATCH_KEY] = seed;
   if (!db || !workflowId) return;
   try {
@@ -370,6 +370,31 @@ export async function runWorkflow(
   // a parameter with a default doesn't count toward it. Existing callers are
   // unaffected — omitting it reproduces today's behaviour exactly.
   repoConfig: RunRepoConfig | undefined = undefined,
+): Promise<WorkflowResult & { backpressure?: boolean }> {
+  // Every route into the runner crosses here, so this is where a run becomes
+  // "live in this process" (`./live-runs.ts`) — for the whole execution, not
+  // just while its row says `running`.
+  const release = workflowId ? markRunLive(workflowId) : () => {};
+  try {
+    return await runWorkflowBody(
+      definition, ctx, config, callbacks, db, models, approvalConfig, workflowId, variants, repoConfig,
+    );
+  } finally {
+    release();
+  }
+}
+
+async function runWorkflowBody(
+  definition: AgentWorkflowDefinition,
+  ctx: TemplateContext,
+  config: ExecutorConfig,
+  callbacks: RunnerCallbacks,
+  db: StateDb | undefined,
+  models: ModelConfig | undefined,
+  approvalConfig: ApprovalGateConfig | undefined,
+  workflowId: string | undefined,
+  variants: VariantConfig | undefined,
+  repoConfig: RunRepoConfig | undefined,
 ): Promise<WorkflowResult & { backpressure?: boolean }> {
   const outputs: Record<string, unknown> = {};
   const { taskId } = ctx;
@@ -701,6 +726,39 @@ export async function runWorkflow(
             // instead of requeueing it as backpressure.
             observeResult: noteStopReason,
             observeError: flagQuotaThrow,
+          },
+          phaseReporter,
+        ),
+      ],
+      [
+        // The per-unit survey (`review.analysis.surveyEngine: units`). In-process
+        // model calls against the host checkout — no sandbox, so no quota hooks —
+        // but on the same ledger, so it gets an `executions` row like any phase.
+        "survey-units",
+        makeSurveyUnitsHandler(
+          {
+            workflowName: definition.name,
+            ctx,
+            config: runConfig,
+            taskId,
+            triggerId,
+            githubAccess,
+            backend: runConfig.sandbox ?? "gondolin",
+            assets: assets
+              ? {
+                  loadPromptTemplate: (p) => assets.loadPromptTemplate(p),
+                  resolveSkillPaths: (n) => assets.resolveSkillPaths(n),
+                }
+              : defaultAssetLoader,
+            resolver: phaseResolver,
+            store: db,
+            workflowId,
+            ledger: {
+              liveness: dockerLivenessPort,
+              observability:
+                db && workflowId ? runScopedObservability(db, workflowId) : telemetryObservability,
+              logger: logger("survey-units"),
+            },
           },
           phaseReporter,
         ),

@@ -29,7 +29,11 @@ resolve a version that was never published. Hence a seventh npm package, against
 WP1's original "private: true" — that line was written when delivery was
 image-only, which §D1 reversed. The `lastlight` CLI grew ~22 MB installed as a
 result (measured, on darwin-arm64; §D1 estimated ~15 MB and did not size
-`@ast-grep/napi`'s platform binary).
+`@ast-grep/napi`'s platform binary). The Python/Go/Java grammars add ~14 MB more
+(every platform's prebuilt `parser.so` ships in each package; see "Language
+tiers"). The sandbox images need no change for them: they vendor this package
+through the CLI's `pnpm deploy` bundle, which carries its prod dependencies,
+prebuilds included.
 
 It is a **leaf**: no `workspace:*` dependencies in either direction, like
 `agentic-pi`. That is why `log.ts` re-declares the `LoggerPort` shape instead of
@@ -248,12 +252,22 @@ a second worktree before.
 
 | Tier | Available | Extractors |
 |---|---|---|
-| 1 | TS/JS with a resolvable project | all, `resolution: "type-aware"` |
-| 2 | TS/JS, project load failed | `deps`, `patterns`, `constants` (ast-grep only, **no reference set A**), `coverage`, and `facts` at `resolution: "name-match"` |
-| 3 | any other language | `deps`, `patterns`, `coverage` |
+| 1 | TS/JS with a resolvable project | all, `resolution: "type-aware"` — plus, on a MIXED diff, the Python/Go/Java files' symbols at `resolution: "name-match"` beside them (and a `degraded[]` entry saying so) |
+| 2 | TS/JS whose project load failed, **or a diff whose only source files are Python / Go / Java** | `deps`, `patterns`, `coverage`, `facts` at `resolution: "name-match"`, and `constants` for **TS/JS only** (ast-grep, **no reference set A**) |
+| 3 | any other language (Ruby, Kotlin, Rust, …) | `deps`, `patterns`, `coverage` |
 
 Tier 2 and 3 emit `coverage: "degraded"` and a populated `degraded[]` naming what
-is missing. **Silence is the failure mode we are engineering against.**
+is missing. **Silence is the failure mode we are engineering against.** Python,
+Go and Java are tier 2 and **never tier 1**: there is no type-checker for them
+here, only name matching.
+
+`constants` stays TS/JS-only on purpose (`CONSTANTS_FAMILIES` in
+`constants.ts`): both the changed-constant scan and the literal sweep are scoped
+to the `tsjs` family, so a new grammar cannot widen `hardCodedDuplicates` on a
+mixed repo, and a TS constant's set B is byte-identical to what it was. A diff
+with Python/Go/Java files in it gets a `constants` `degraded[]` entry naming
+them. The Go and Java descriptors carry `const` / `static final` rows ready for
+the day that is measured; Python has none (no immutability syntax).
 
 ## `resolution` — the syntactic engine, and what it is worth
 
@@ -266,10 +280,70 @@ declaration sites in the repo binding that name); tier 1 carries
 building it costs a repo-wide parse a type-resolved run has no use for.
 
 It is fed by `src/langs/`: a `LanguageDescriptor` is a TABLE of tree-sitter node
-kinds (declarations, constants, references, literals, the call kind) plus three
-predicates (`isExported`, `isTestPath`, and nothing else). **Not a plugin
-system** — `register.ts` is a literal array. `tsjs.ts` is the only entry, and it
-exists so the tier-2 path runs through the code a second language would.
+kinds (declarations, constants, references, literals, the call kind, import
+kinds) plus predicates (`isExported`, `isTestPath`, and an optional `calleeOf`).
+**Not a plugin system** — `register.ts` is a literal array: `tsjs.ts` (the three
+grammars `@ast-grep/napi` bundles) plus `python.ts`, `go.ts`, `java.ts`.
+
+- **A declaration rule is still data.** Beyond `kind` / `nameField` /
+  `qualifyBy` / `nameKinds` / `topLevelOnly`, five optional columns cover what the
+  new languages needed, each absent on every TS/JS row so that output is
+  byte-identical: `parentKinds` (Java's `variable_declarator` is a field only
+  under `field_declaration`), `memberOf` (Python's `function_definition` is a
+  `method` only directly inside a `class_definition`; Java's method is an
+  `interface-method` inside an interface), `receiver` (Go's
+  `func (s *Service) Run()` qualifies as `Service.Run` from the receiver's
+  `type_identifier`), `refineKind` (Go's `type_spec` is `struct` / `interface` /
+  `type` by its `type` field) and `extendToParent` (a Python decorator block is
+  part of the function's range, so a hunk that only changes `@login_required`
+  maps to the function).
+- **`family` is the name-matching boundary.** `tsjs` for the three TS/JS
+  grammars, one each for the rest. References and `nameAmbiguity` never cross a
+  family (a Python `run` is not a Go `Run`), and the repo-wide index lists only
+  the families the diff DECLARED something in — so a TS-only diff lists exactly
+  the files it always did, and its `--max-files` truncation point cannot move.
+- **Kinds per language** (from each grammar's `src/node-types.json`): calls are
+  `call` / `call_expression` / `method_invocation` (Java's callee is
+  `object.name`, hence `calleeOf`); `isExported` is no leading underscore and
+  not inside a function (Python, dunders count as public), an upper-case first
+  letter (Go), a `public` modifier or an interface member (Java); `isTestPath`
+  is `test_*.py` / `*_test.py` / `tests/` / `conftest.py`, `_test.go`,
+  `src/test/` or `*Test.java`. `tests/langs-dynamic.test.ts` asserts every kind
+  a table names exists in its grammar (`supportedKinds(...).rejected` empty) —
+  ast-grep refuses a whole rule over one unknown kind, which is a silently
+  empty scan.
+
+**The three new grammars are DYNAMIC** (`src/langs/dynamic.ts`):
+`@ast-grep/lang-python` / `-go` / `-java`, registered through `@ast-grep/napi`'s
+`registerDynamicLanguage` — the same tree-sitter runtime, not a second one. Each
+package is a prebuilt `parser.so` per platform (linux x64/arm64, darwin
+x64/arm64, windows x64) plus a registration record; its `postinstall` only logs
+when the prebuild matches, so installs with lifecycle scripts off work
+(verified on `node:24-slim` arm64 + amd64 and `node:24-alpine` arm64). ~14 MB
+installed together (python 5.9, java 4.9, go 3.0). Three properties of the API
+shaped the module, each measured on napi 0.45.2:
+
+- **A bad `libraryPath` does not throw — it panics the Rust side and ABORTS the
+  process** (`GetLibPath(NotFound)`, uncatchable, no envelope). So every library
+  is preflighted: it must exist, and `process.dlopen` must map it —
+  `Module did not self-register` is the success signal (the loader mapped it; it
+  is simply not a Node addon). Anything else is that language's failure reason.
+- **Registration is once per process**: a second call is silently IGNORED. So
+  there is exactly one call, carrying every grammar that passed preflight, made
+  lazily on the first parse that needs one (a TS-only run never pays for it).
+- **Someone else may have registered first**, making ours the ignored call — so
+  each grammar is then PROBED with a real parse before it counts as loaded.
+
+A grammar that fails is **loud and scoped**: its files count as unparsed, the
+`facts` `degraded[]` gets one entry NAMING the language and the reason,
+`files[].analysed` is `false`, and `languages[].parsedFiles` stays honest (it
+is an actual parse, so it reads 0). `forceGrammarUnavailable` is the test seam;
+it deliberately does not touch the process-global native registration.
+
+Per-file entry points for consumers outside the index: `scanDeclarations(path,
+source)` (every named declaration, or `null` when no grammar claims the path or
+it did not parse) and `scanImportLines(path, source)` (the lines the
+descriptor's `importKinds` occupy).
 
 **`nameAmbiguity` is DATA, never a filter.** This layer generates hypotheses and
 the seeder ranks them; filtering here would delete evidence nothing downstream
@@ -417,8 +491,12 @@ is keeping the install out of the tree `lastlight-facts` is pointed at.
 
 A Go PR that produced nothing now says so in a shape **no clean run can ever
 take**: a language was recognised, thirty-one files of it changed, and nothing
-parsed one of them. Measured on the real corpus — keycloak `37429` reads
-`[properties 45/0, java 2/0, xml 1/0]`.
+parsed one of them. Measured on the real corpus before the Java grammar landed —
+keycloak `37429` read `[properties 45/0, java 2/0, xml 1/0]`; Java now reads
+`2/2` on `ast-grep`, and the rows no engine reads (`properties`, `xml`) keep
+`engine: "none"`. A language with a descriptor gets `engine: "ast-grep"` on its
+row whatever the run's engine was — a `.py` file in a tier-1 TS run is not a
+file tsgo failed to read.
 
 - `id` comes from the extension (`languageIdOf`); a language nobody thought
   about falls back to its bare extension rather than vanishing.
@@ -444,8 +522,12 @@ parsed one of them. Measured on the real corpus — keycloak `37429` reads
 | `all` | one envelope, every payload — what a workflow phase writes. With `--stage-diff` it also writes the **staged diff** (`.lastlight/pr-review/diff/`), an index plus one patch per changed file. See below |
 | `prepare` | **not an extractor** — installs dependencies so a probe can be RUN, and writes `probes/env.json`. See below |
 | `discharge` | each `survey` branch's exit gate — every obligation the family owns carries a `QUOTE` / `ABSENT` / `PARTIAL` / `PROBE` discharge in `hypotheses/<family>.jsonl`. Degrades to the `test -s` floor on an unreadable `obligations.json` **or** on `contract: "minimal"`. See below |
-| `probes` | the `falsify` loop's exit gate — every hypothesis that needed a probe has a verdict, and every claim of evidence (`reproduced` / `corroborated` / `refuted`) has a transcript. Since issue #405 it also refuses `reproduced` on a **behavioural** claim (`isBehaviouralClaim` — a stated consequence live at head, derived from the evidence record) whose every command only reads code (`isReadOnlyCommand`, quote-aware) — that is `corroborated` — and reports transcripts borrowed from another hypothesis (`borrowedFrom`) without failing on them. `probeStrength()` is the one reader of what a verdict counts for |
-| `findings` | the `adjudicate` loop's exit gate — the **conservation check**. See below. `--repair` (the `reconcile` phase) also stamps each hypothesis-derived finding's **derived severity** (`finding-severity.ts`: evidence record + probe strength; the model's value kept as `declaredSeverity`) plus its **`rankEvidence`** (crosses a boundary / strongest probe / merged-hypothesis count, over non-refuted constituents), which the poster breaks severity ties on — the one derivation the evals read too (`buildSeverityIndex`) |
+| `probe-plan` | which hypotheses `falsify` owes a verdict on — the gate's own `requiresProbe` set, ranked and capped at `--max-probes`, written to `probes/plan.json` + `probes/plan.md`. See below |
+| `probes` | the `falsify` loop's exit gate — every hypothesis that needed a probe (exactly `probes/plan.json`'s `selected` when a plan exists, else `requiresProbe` over every row) has a verdict, and every claim of evidence (`reproduced` / `corroborated` / `refuted`) has a transcript. Since issue #405 it also refuses `reproduced` on a **behavioural** claim (`isBehaviouralClaim` — a stated consequence live at head, derived from the evidence record) whose every command only reads code (`isReadOnlyCommand`, quote-aware) — that is `corroborated` — and reports transcripts borrowed from another hypothesis (`borrowedFrom`) without failing on them. `probeStrength()` is the one reader of what a verdict counts for |
+| `findings` | the **conservation floor** — `--repair` only (the `reconcile` phase; the grading gate went with the adjudicator). See below. It also stamps each hypothesis-derived finding's **derived severity** (`finding-severity.ts`: evidence record + probe strength; the model's value kept as `declaredSeverity`) plus its **`rankEvidence`** (crosses a boundary / strongest probe / merged-hypothesis count, over non-refuted constituents), which the poster breaks severity ties on — the one derivation the evals read too (`buildSeverityIndex`) |
+| `units` | the unit survey's INPUT — one unit per changed function/method, at most one module unit per file (its module-scope regions plus folded small functions), one `pr` unit for obligations no unit holds, each carrying the COMPLETE model request behind a run-constant shared prefix. See below |
+| `units-ingest` | the unit survey's replies → `hypotheses/<family>.jsonl` rows of the existing shape, plus `units/ingest.json`. See below |
+| `sites` | the `sites` review engine's deterministic steps: `--plan`, `--check <site-id>`, `--merge`, `--check-select`, `--finalize`. See below |
 | `toolchain` | the manifest and what actually resolved |
 
 Three fixes must not regress. Two are carried forward from v3 and live in
@@ -769,7 +851,7 @@ and every reader agree on one id scheme (issue #405 — surveys label a
 placeholder row `-000`, which put every label one below its canonical id and
 sent an adjudicator's hand-written self-check "correcting" its citations into
 collisions). Byte-preserving and idempotent; `--ledger` never writes.
-`--ungraded` (the `spec` branch, whose obligations are not on disk) is that
+`--ungraded` (the `spec` family, whose obligations are not in `obligations.json`) is that
 rewrite plus the non-empty-file floor.
 
 The check itself is **pure**: it reads two artifacts and writes nothing. There is no
@@ -936,13 +1018,14 @@ because this package cannot see the PR body or the linked issue it comes from.
 
 ### `findings` — conservation, and the floor that makes it a mechanism
 
-`src/findings.ts`, WP6c. It is the `adjudicate` phase's `until_bash`, so **exit 0
-closes the loop** and non-zero means iterate again — the same contract as
-`probes`, and for the same reason it is not wrapped by `--never-fail`.
+`src/findings.ts`, WP6c. Only `--repair` remains — the `reconcile` phase's
+model-free floor under `site-finalize`. The grading gate described below was the
+removed adjudicate phase's `until_bash`; the conservation rules it enforced are
+what `--repair` still restores.
 
 #### Identity is assigned at ingest, not minted by the model
 
-`src/hypotheses.ts` is the one reader `findings`, `--ledger` and `probes` all go
+`src/hypotheses.ts` is the one reader `findings`, `probes` and `sites` all go
 through, so no two gates can disagree about which claims exist. Every row gets
 **`<family>-NNN`** — the family from the FILENAME, the ordinal from its position
 in an append-only file. Both halves were bought with a measurement on the first
@@ -1014,9 +1097,22 @@ Four decisions in it that are decisions, not implementation detail:
   audits. The note says so, so that pass is never read as *"the adjudication was
   complete"*. A missing or unparseable `findings.json` is the separate failure,
   and it fails — the loop should get another iteration to write one. `--repair`
-  deliberately **does not invent one**: a fabricated `summary`/`event` is a
-  review nobody wrote, and a loop that merely runs out of iterations does not
-  fail the run anyway.
+  **writes one when it is MISSING over a non-empty hypothesis set** (it used
+  to refuse — *"a fabricated summary is a review nobody wrote"* — which was
+  right while `review` always ran). With the pipeline on, `review` is skipped
+  by default and `adjudicate` is the **only** writer, so an adjudicator that
+  fails, times out or never writes the file left post-review failing *"could
+  not read findings"*: red run, nothing posted, per-head dedup blank, and the
+  30-minute sweep re-buying the whole pipeline on the same SHA forever. The
+  written document says what it is — every hypothesis at `internal` (the row
+  the floor writes for an uncovered one), `event: "COMMENT"`, a summary saying
+  adjudication did not complete so nothing was weighed or posted inline, and an
+  `incomplete: {phase: "adjudicate", reason}` marker. It is safe in every
+  workflow shape: when `review` RAN, a missing file means it failed and
+  post-review (`none_failed` on `review`) does not run. **Not** invented: a
+  document when there are no hypotheses (nothing to conserve; post-review then
+  fails loudly as before), and an UNREADABLE file is never overwritten —
+  somebody wrote it.
 - **`FindingsDocumentSchema` is LOOSE at every level** (`schema.ts`). The real
   contract lives in `apps/server/skills/pr-review/references/findings-schema.md`
   and the adjudicator writes a superset — `mechanism`, `bothEnds`, `evidence`.
@@ -1058,46 +1154,352 @@ repair list. It goes into an agent's context, and *"3 hypotheses unaccounted
 for"* without the ids cannot be acted on by the next iteration — being acted on
 is the entire point.
 
-#### `--ledger` — the same reading, the other audience
+### `units` / `units-ingest` — the unit survey's deterministic halves
 
-`checkFindings` answers the HARNESS ("may the loop stop?") with an exit code.
-`buildFindingsLedger` answers the ADJUDICATOR ("what must I account for, and
-what have I not?") with a list: every declared id by family, with its obligation,
-severity and path, marked `[x]`/`[ ]`, plus an outstanding set. Both read through
-the same `inspect`, so the checklist and the verdict cannot disagree about which
-ids exist — which is the reason it lives here rather than in the prompt as an
-instruction to go and count.
+`src/units.ts`, `src/units-render.ts`, `src/unit-response.ts`,
+`src/units-ingest.ts`; the design and the file contract are
+[`docs/plans/pr-review-units-sites.md`](../../docs/plans/pr-review-units-sites.md). Selected by
+the `review.analysis` evidence pipeline, whose only survey it is. The
+pipeline is `units` (bash) → `survey-units` (core, one `completeSimple` call per
+unit) → `units-ingest` (bash); it replaced the five-branch agent `survey`
+fan-out.
+Everything here is deterministic and testable without a model; **core only does
+the model I/O**, and does not depend on this package for it.
 
-It is what makes the gate satisfiable on the FIRST attempt. Measured on
-`prreview__skillspro-1587-r1`: attempt 1 spent **426 s and $0.52** reconstructing
-the id set from six `.jsonl` files, missed some, and bought a second **274 s /
-$0.43** attempt — 40% of the case's wall clock and 38% of its cost, for a set
-that is mechanically derivable.
+```bash
+lastlight-facts units --dir .lastlight/pr-review --repo .        # → units.json
+lastlight-facts units-ingest --dir .lastlight/pr-review          # → hypotheses/*.jsonl, units/ingest.json
+```
 
-Three properties that are decisions:
+- **The text and the changed lines come from git, never the working tree.** One
+  `git diff` over the merge-base range (the same private `diffRange` as
+  everything else) gives changed and removed lines; every shown line is `git
+  show <headSha>:<path>`. `facts.json` supplies the shas and ENRICHMENT only —
+  callers (reference sites, with the calling line's text) and callees — so a
+  tier-3 envelope still gets a unit for every changed line, just no neighbours.
+- **A unit is the OUTERMOST function-like declaration** holding a changed or
+  removal line (functions, methods, `const f = () => …`, found with ast-grep on
+  the head blob); a class is not a unit, its methods are. **Python, Go and
+  Java** get the same through their descriptors: `scanDeclarations` on the
+  head blob, keeping `function` / `method` / `constructor` /
+  `interface-method` sites (a Python function nested in another is part of
+  its parent; a decorator block is part of its function), named as `facts`
+  names them (`Service.run`, Go's receiver-qualified `Service.Run`). Imports
+  come from the descriptor's `importKinds` (`scanImportLines` — Go's whole
+  `import ( … )` block, Python's parenthesised `from x import (…)`); TS/JS
+  descriptors declare none, so that path is unchanged. A file whose grammar
+  did not load or did not parse is surveyed as module regions, and a
+  `degraded[]` entry names it (and the grammar's reason). Changed lines no
+  symbol holds go into **at most one `module` unit per file**: every such
+  region in head order (±3 context lines, regions closer than 3 lines merged),
+  a `⋮` elision row between them. A small changed function (≤
+  `SMALL_SYMBOL_LINES` = 15, no attached obligation) is **folded** into that
+  module unit as one more region, shown whole — only after attachment, and not
+  when it is its file's lone candidate (folding would save nothing). Its
+  callers and callees survive because neighbours are computed from the symbols
+  declared inside a unit's *cores* (the owned extents — a symbol body, a
+  changed-line cluster, a folded function), while the *windows* (cores plus
+  context) decide what is shown and which references are "inside". Measured on
+  this repo's `cef8b22a`: 51 units / 457k chars → 24 / 307k (one test file had
+  gone from 7 module units + 3 one-line helper units to 1). Lockfiles,
+  binaries, minified bundles and files over `MAX_SCANNED_FILE_BYTES` are listed
+  in `skipped[]` (the last one also in `degraded[]`, since its lines are then
+  in no unit).
+- **Obligations attach by anchor**: the unit whose extent holds the symbol's
+  `declaredAt` (a contract delta resolves to its symbol first), else its
+  `introducedAt` line, else the first unit overlapping the symbol's changed
+  hunks (a class obligation lands on the changed method), else the `pr` unit —
+  which shows an excerpt at each anchor. Every obligation is in exactly one
+  unit, whatever the cascade below does.
+- **Line tags are the contract.** `L0042+|` changed, `L0042 |` unchanged, `-|`
+  removed (untagged — it does not exist at head), each block under `FILE
+  <path>`. The reply's `line` must be a tag; `requestLineTags` reads them back
+  OUT of the request, so the ingest judges a reply against exactly what the
+  model saw, and a row's quote text is the shown line — it always resolves.
+- **The shrink cascade** holds each request to `--max-chars` (100 000): trim
+  callers/callees/imports/candidates, then drop them, then — a module unit —
+  spread its regions in order over as few units as fit at full context, then
+  split any one region or symbol still too long into overlapping passes (each
+  obligation to the piece owning its anchor).
+  Every step marks the unit `truncated` and names itself in `degraded[]`.
+  `--max-units` (150) is a spend bound: past it the lowest-priority units are
+  dropped by name and their obligations move to the `pr` unit.
+- **A large unit is surveyed once per family** (units-v6). A symbol or module
+  unit owning more than `FAMILY_SPLIT_CHANGED_LINES` (40) touched lines
+  (`--family-split-lines`) becomes one unit per asked family — same source,
+  imports and neighbours; a request asking ONLY that family, carrying ONLY its
+  obligations (spec obligations ride with the `spec` sibling) and taking only
+  its defects. Ids `u-NNN-<family>` (inside core's `SAFE_UNIT_ID`), with
+  `family` + `splitOf` on the unit; every obligation still lands exactly once;
+  the `pr` unit never splits; `--max-units` counts units before the split.
+  Measured reason: the v5 replay audit (Haiku 4.5, 8 cases × 2 arms, 3/50 gold)
+  had defects/unit flat at 0.31–0.41 whatever the size and 81% of 100+-line
+  units answering `[]`.
+- **Deterministic**: units ordered by file then line, `u-NNN` in that order
+  (a family sibling `u-NNN-<family>`),
+  `requestSha256` = sha256 of the request, and no sha or timestamp inside a
+  request, so an unchanged unit renders byte-identically across pushes.
+  `UNITS_PROMPT_VERSION` (now `units-v7`: breadth — every defect a changed
+  line causes or makes reachable, only the NOT FINDINGS categories kept out,
+  no bar, no count prior — plus v6's verdict claims, required consequence and
+  family split) is bumped whenever the rendering changes.
+- **Shared prefix first — for the provider's prefix cache.** `request` =
+  `UNITS_SHARED_PREFIX` + the unit-specific part. The prefix (~7.4k chars: task,
+  line-tag legend, the ALWAYS-asked families, NOT FINDINGS, evidence record,
+  response shape, generic rules, ending `=== THIS UNIT ===`) carries **no** unit
+  id, count, file or per-unit family subset, so it is byte-identical across
+  every unit of every run; `units.json` records it as `sharedPrefix` +
+  `sharedPrefixSha256`. Anything that varies by unit goes AFTER the separator —
+  including a conditional family (`tests`, asked only with a `tests`
+  obligation). The prefix holds no `L<n>` tag or `FILE` header, so
+  `requestLineTags` reads only the unit's part. `tests/units.test.ts` pins all
+  of it.
+- **An answer's claim is a verdict, and "no control" owes a consequence.** The
+  request asks for the model's own verdict sentence (never the obligation
+  restated) and a non-null `consequence` whenever `control_site` is `none` or
+  the control is advisory/bypassable. Ingest checks the checkable half: an
+  entry with no holding control (`control_site` none/unknown or `authority:
+  "advisory"`) and a null consequence is listed in the unit's
+  `consequenceGaps` with a warning in `units/ingest.json` — the row is written
+  as the model wrote it (conservation holds, nothing derived moves). v5 audit:
+  48% of 482 answers restated the question, 89% had a null consequence, 198
+  with `control_site: "none"`.
+- **Unprompted `code_change` defects are demoted IN CODE, by the typed
+  field** (units-v7). A defect entry (not an obligation answer) whose
+  `evidence.trigger` is `code_change` is not written to `hypotheses/`; it is
+  recorded in full (label, family, claim, file, line, evidence, `reason:
+  "code_change"`) in the unit's `demoted` list in `units/ingest.json`, with a
+  document-level `demotedCount`. An obligation's answer is **never** demoted —
+  every obligation still gets exactly one row, whatever its trigger — and no
+  prose or regex filter exists. Measured reason (8 skillspro cases × 2 arms,
+  50 gold): v1 ("over-produce") credited 11/50; 320 of its 764 unprompted
+  defects were `code_change` and none was credited, while the input/state/
+  unknown defects carried 8. v4–v6's DEFECT BAR asked the model to hold such
+  defects back and credited gold fell to 6, 3, then 5–6 — breadth drives
+  recall, so the request asks for everything and ingest removes the one
+  typed noise class.
+- **The reply carries no `severity`, no `needsProbe`, no discharge code** —
+  `UnitResponseBodySchema` is `{unitId, answers[], defects[]}`, each entry
+  `{obligation?, family, claim, file?, line, evidence}` with the survey-pass
+  evidence record typed strictly. The row's `discharge` is
+  `deriveVerdict(evidence).discharge`.
+- **Nothing is silently dropped.** A missing, `ok: false`, stale (its
+  `requestSha256` is not the unit's) or unparseable reply, an invalid entry,
+  or an obligation the reply skipped each still yields a row: `discharge:
+  "PROBE"`, the claim saying the survey could not answer it (keeping whatever
+  the model did write), and evidence with `control_site: "unknown"` — a value
+  no model is offered — which derives to a probe at `Minor`. An invalid line
+  keeps the row and loses only its location. A measured family with no
+  obligation gets one placeholder row saying what happened (no hypothesis, or
+  could not look), so its gate never reads "surveyed nothing". Then every
+  family's `discharge` gate runs over the ingested set and lands in
+  `units/ingest.json`.
+- **Spec obligations come from `spec-obligations.json`** — core's
+  `SpecObligationSet` (`review-spec.ts`), written before `units` runs
+  (`--spec <file>`, default `<dir>/spec-obligations.json`). Each attaches to
+  ONE unit: the first candidate FILE (best match first) that has any unit,
+  and within it the unit holding the most touched lines (ties → earliest);
+  no candidate with a unit ⇒ the `pr` unit. One unit, never several, because
+  every obligation is asked exactly once. They render under OBLIGATIONS as
+  `S-n · family spec · asked in <source>` with the criterion, the candidate
+  files and the question; `units.json` records them as `specObligations`, and
+  ingest resolves `S-n` against THAT list (not the file) — what the model was
+  asked. Answers become `hypotheses/spec.jsonl` rows in the agent spec
+  survey's shape: `obligation: "S-n"`, `bothEnds.introducedAt` = the source
+  (`issue #12` / `the PR body`), and a `path`. An absent file is still a
+  `degraded[]` entry (so `units` exits 3 then); a malformed one — bad JSON,
+  wrong shape, repeated ids — is a `degraded[]` entry and no spec obligation,
+  never a crash. `discharge --family spec` stays `--ungraded`: graded, it
+  would read `obligations.json`, where `spec` is NOT MEASURED, and grade
+  nothing.
+- **The reply rule is ONE rule, shared with core.** `findUnitObject(raw,
+  unitId)` finds the reply (every balanced top-level `{…}` span, string-aware,
+  an unclosed `{` skipped and scanning continued, fence bodies too; the first
+  whose `unitId` matches, else one level of nesting) and
+  `isUsableUnitReply(obj, unitId)` accepts it (`unitId` matches, `answers` and
+  `defects` are arrays). The `survey-units` handler applies the same two
+  before calling a unit `ok` and caching it, and its test copies
+  `tests/unit-reply.test.ts`'s case table verbatim — a reading the handler
+  cached that ingest calls `invalid` would be wrong forever.
+- **An unanswered row declares `needsProbe: true`** — the only row ingest
+  stamps it on (missing / failed / stale / invalid unit, or an obligation a
+  partial reply skipped or garbled, or one no unit carried). `requiresProbe`
+  reads the raw field (or a Critical), never the derivation, and unknown
+  evidence derives to Minor, so without the stamp `falsify` owed no verdict on
+  the rows that most need one. `requiresProbe` itself is untouched — deriving
+  there would move the agent-survey baseline mid-experiment.
+- **The shell fallback document validates.** `pr-review.yaml`'s `fallback()`
+  prints `baseSha`/`promptVersion`/`responseSchema: null` and no `skipped` /
+  `sharedPrefix`; `UnitsDocumentSchema` accepts exactly that for a
+  `coverage: "none"` document with empty `units` (`FallbackUnitsDocumentSchema`,
+  built by `fallbackUnitsDocument(reason, headSha)`), and requires every field
+  otherwise. Ingest reads an empty document as `unitsState: "not-surveyed"`
+  (nobody looked — reason propagated, exit 3) unless its reason starts with
+  `NOTHING_TO_SURVEY` (`"nothing-to-survey"`, a clean answer).
+- Exit codes: `units` 0 full or nothing to survey (`coverage: "none"`, said
+  why), 3 degraded, 2 missing input (a `coverage: "none"` document is still
+  written); `units-ingest` 0 all answered and every gate passes, 3 otherwise
+  (rows still written), 2 unreadable `units.json` (rows still written for every
+  obligation). `--never-fail` flattens both to 0, like every deterministic
+  phase.
 
-- **It ALWAYS exits 0**, unlike the two gate modes beside it. Its caller is the
-  agent's own bash tool, where the gate's non-zero *"iterate again"* would read
-  as a tool failure. Two audiences, two exit contracts; conflating them is how
-  the checklist would come to be treated as the gate.
-- **Nothing is capped.** `renderFindingsCheck` stops at 20 ids because it is a
-  log line; a checklist that elided entries would reproduce the exact omission it
-  exists to prevent. The bound is on each claim (`titleFrom`, one sentence) and
-  the outstanding list WRAPS rather than truncating.
-- **An unreadable `findings.json` means every id is outstanding**, not zero.
-  `inspect` early-returns with no gaps in that case — correct for the gate, which
-  fails on the document error alone, and a lie of omission for a checklist.
+### `probe-plan` — which rows `falsify` owes, decided in code
 
-`fresh_context: true` on the `adjudicate` loop is what makes re-running it the
-whole retry mechanism: iteration 2 carries no prior transcript
-(`phase-executor.ts` passes `previousOutput: ""`), so the ledger is how a retry
-learns what is left — freshly, rather than from stale plumbing.
+`src/probe-plan.ts`. The decision used to live in the falsify prompt — *probe
+every row with `"needsProbe": true` and every row with `"severity": "Critical"`*
+— and a unit-survey row never carries a `severity` field: it is DERIVED
+(`severityOf`, `survey-verdict.ts`). The gate derives it and the prompt could
+not, so measured 2026-09-27 the gate owed 21 rows on `1587-r1` and falsify wrote
+one verdict.
 
-What it deliberately does **not** do: read a transcript, judge a verdict,
-validate a quote, or check anything about `summary` / `event` / `verdict`. Quote
-*resolution* is checked upstream; quote *semantics* still is not. v3's five-line
-gate earned the investigation's only gold match and v2's full validator is what
-made it expensive.
+- **The owed set is the gate's.** `requiresProbe` (a derived Critical, or a raw
+  `needsProbe: true`) over every row, then ranked on the evidence record only —
+  Critical first, then a survey's own ask, then discharge `ABSENT` > `PARTIAL` >
+  `QUOTE`, then declaration order — and cut at `--max-probes`
+  (`review.analysis.maxProbes`, `null` = no cap). A deterministic tiebreak, not
+  a quality model; the micro-falsify eval is what should move the cap.
+- **One list, two readers.** `probes/plan.md` (the selected records, verbatim,
+  in rank order) is what falsify reads; `probes/plan.json` is what the `probes`
+  gate owes — exactly `selected`, so it cannot owe a row the agent was never
+  shown.
+- **No plan ⇒ the old owed set.** `checkProbes` falls back to `requiresProbe`
+  over every row (an older workflow, a replayed workspace), which is why the
+  phase runs `--never-fail`: a failure costs the cap, never a probe. Exit 0 =
+  plan written, 2 = it could not be.
+
+### `clusterSites` — rows grouped into sites (library only)
+
+`src/site-cluster.ts`. The proposed replacement for row-level admission
+(`docs/plans/pr-review-units-sites.md`): a site is a run of rows in one file
+whose anchor lines sit within `window` (default 20) of their neighbour, single
+linkage, **across families**; ranked by support (rows in the site), then
+strongest derived severity, then declaration order. The anchor is a row's first
+quote with a path and line, else `bothEnds.introducedAt` — never claim prose.
+An unanchored row is its own site; every row lands in exactly one.
+
+- **Why support, why across families.** The $0 screen
+  (`apps/evals/scripts/cluster-screen.ts`, 16 fixtures, 14 gold) at ±20: 0 gold
+  collisions, 9 / 12 of 14 gold in each case's top 5 / 10 sites, against 7 of
+  14 kept by `top:40`. Splitting by family (`byFamily`, kept as the ablation)
+  halves it; severity-first is worse because unit-survey severity is nearly
+  flat.
+- **A low rank is not a deletion.** Both gold outside the top 20 are lone rows —
+  the cost of any vote.
+- **`planProbeSites`** turns sites into a falsify plan: the top `topSites`
+  sites by support, then every row `planProbes` (capped at `maxProbes`) selects
+  that no top site holds, as a single-row site (`origin: "owed"`) — which keeps
+  today's Critical / survey-asked probes and is the only way a lone row reaches
+  the oracle. Every row is in at most one site, so sites can run in parallel
+  with one verdict writer per row. Each site carries its own `ProbePlan`
+  (rows the gate would not owe get reason `site`); `union` is what the gate
+  checks. `renderProbePlan(plan, set, site)` opens a per-site `plan.md` with
+  the site and the ask to label rows with a `claim`; `writeProbePlanFiles`
+  writes any prepared plan.
+- **`planProbeSites` is not wired in**: no CLI verb, no phase. Measured through
+  `micro-falsify --plan sites:<k>`. `clusterSites` itself IS wired — through
+  `sites --plan` (below), with `voters: "unit"`, `maxSpan: 60` and test-file
+  sites demoted.
+
+**Options from the paid site pilot** (all off by default, so the screen numbers
+above still describe the default plan; `planProbeSites` takes the same ones):
+
+- **`voters: "row" | "unit"`** (default `"row"`). Votes echo — 12 rows from one
+  unit in one pilot site, and a family-split unit re-reads the same lines up to
+  six times. Every `Site` now carries `voters` (distinct voters) beside
+  `support` (rows); `"unit"` ranks on voters, then rows, then severity, then
+  declaration order. Distinct voters ranked about as well (8.7 vs 9 of 14 gold
+  in the top 5) and cannot be inflated by one chatty unit. A voter is a row's
+  `unitId`; pass `units` (`units.json`'s `{ id, splitOf }`) to collapse split
+  siblings to their `splitOf` — rows carry only `unitId`, and the
+  `<splitOf>-<family>` id format is deliberately not parsed. A row with no
+  `unitId` is its own voter.
+- **`maxSpan`** (default `null`). Single linkage chains: the pilot's `site-001`
+  ran lines 1–125 of one file on 38 rows. A run whose span (last − first line)
+  would pass `maxSpan` starts a new site.
+- **`skipPath`** (e.g. `isTestPath` from `project.ts`, the per-language
+  test-file heuristic). 3 of the pilot's top 10 sites were `*.test.ts` files.
+  Skipped rows form no site and are listed in `SitePlan.skipped`, so
+  `sites` ∪ `skipped` still holds every row once. In `planProbeSites` a skipped
+  row that `planProbes` owes still gets its own `owed` site — skipping changes
+  ranking, never drops a Critical.
+- **`demotePath`** (the `sites` engine passes `isTestPath`). A matching site
+  still forms but ranks after every other site, in its own vote order; a site
+  never spans files, so it is wholly demoted or not. It replaced `skipPath` in
+  `sites --plan` (2026-09-29): at a fixed cap, test sites ranked with the rest
+  displaced better ones (H3 audit: top 5 + tests 15 gold-mapped rows in a site,
+  tests skipped 16), but skipping them left slots empty on a PR with few sites
+  and lost the gold Martian files against test code. Demoted, they take only
+  free slots, so coverage cannot fall below the skip plan's.
+
+**Per-site investigator inputs.** Rows only choose WHICH sites to look at; the
+investigator gets the site plus short leads and writes the findings.
+
+- **`siteLeads(site, set)`** → `{ leads, withoutSubject }`. One lead per
+  distinct `evidence.subject` (trimmed; merged by lowercase + collapsed
+  whitespace), carrying every row id and the min anchor line; ordered by rows
+  desc, then line. Only the typed `evidence.subject` is read — claim prose
+  echoes and would anchor the investigator on the survey's framing. Rows with
+  no subject are listed in `withoutSubject`.
+- **`renderSiteBrief(site, set, { leads })`** — data-only markdown: site id,
+  path, line range, rows/voters, then the numbered leads
+  (`subject (family, Lnn, N rows)`) or a line saying none are given. The
+  prompt carries the instructions, so a with/without-leads arm differs in the
+  lead list alone.
+
+### `sites` — the sites review engine's deterministic steps
+
+`src/site-review.ts`, exported from `index.ts`. With `review.analysis` on,
+pr-review runs `site-plan` → `site-review` (a static 16-branch fan-out) → `merge` →
+`select` → `site-finalize` after the unit survey — the only review engine
+(docs/plans/pr-review-units-sites.md). Every step but the investigators and `select` is this
+command. The rows stop being the items the review weighs and become a VOLUME
+signal: where many independent units pointed is where an investigator looks.
+
+- **`--plan`** (`site-plan`): `clusterSites` over the hypothesis rows
+  (distinct-unit votes, window 20, `maxSpan` 60; test-file sites rank after
+  every other site — `clusterSites`' `demotePath: isTestPath` — so they fill only
+  the slots code sites leave free, counted as `testSites`), top 5 →
+  `sites/plan.json` plus one brief per SLOT, `sites/site-001.md` … (`--top`
+  1–8 / `--window` override; `--slots <n>` is the fan-out's branch count, 16 in
+  pr-review, and must hold the slots in use). **`--pair`** puts a second
+  investigator on every selected site: slot 8 + `r` (`PAIR_SLOT_OFFSET`)
+  re-briefs rank `r`, marked `pairOf` in the plan, and the workflow gives slots
+  9–16 `models.review-site-pair`; `--merge`'s proximity groups then propose the
+  two investigators' duplicates. It clears `sites/` first. An unused slot gets a
+  brief saying there is no site, and `--plan` writes its
+  `{"site", "empty": true}` line itself, so the fan-out's
+  `skip_satisfied_branches` pre-gate starts no session for it. Each brief ends with the slot's assignment: the site id, the one
+  file it writes (`sites/<id>.findings.jsonl`) and how many probed suspicions
+  a `none` needs (`noneChecksRequired`: 1 for a site of ≤ 3 rows, else 2).
+- **`--check <site-id>`** (each branch's `until_bash`): 1–3 grounded findings,
+  each with `importance` `must-fix | worth-mentioning | nit`; or a `none` whose
+  `checked` list carries enough suspicions each answered by an EXECUTED command
+  (`isExecutionCommand` — falsify's `isReadOnlyCommand` classifier, so the two
+  gates agree on what a read is); or `empty` on a slot the plan left empty.
+  This gate moved here from `apps/evals/src/site-review.ts` (which re-exports
+  it), so the replay and the pipeline run the same code; `requireImportance`
+  is on in the pipeline and off for the replay's older prompts.
+- **`--merge`** (`merge`, `output_var: siteMerge`): pools every slot's
+  findings as `F1…Fn` with an excerpt, and PROPOSES cross-site duplicate
+  groups (same file, lines within ±10) — it cannot decide "same defect", no
+  rule reads prose. Writes `sites/merged.json` + `merged.md`; stdout is the
+  select prompt's input.
+- **`--check-select`** (`select`'s loop gate): conservation over
+  `sites/selected.json` — every `F` id in exactly one item. A selection may
+  merge and demote, never silently drop.
+- **`--finalize`** (`site-finalize`): `findings.json` in the shape
+  `post-review` reads — each item at its primary finding's path/line,
+  `existingCode` = that line's text, severity must-fix → Important,
+  worth-mentioning → Minor, a `nit` or an `alreadyRaised` item (select saw the
+  point in the PR's prior discussion) filed at tier `internal`, category
+  `defect`; every hypothesis row id in `internal[]`, so `reconcile`'s
+  conservation holds. A missing or invalid `selected.json` falls back to one
+  item per pooled finding at the investigator's own importance, so a failed
+  `select` still posts.
+
+Exit codes: the two gates are loop conditions — 0 satisfied, 3 iterate again,
+never flattened by `--never-fail`. The three steps are 0, or 2 on a thrown
+error (`--never-fail` flattens that to 0).
 
 ## `toolchain.json` — the single source of truth
 

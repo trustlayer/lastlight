@@ -23,7 +23,7 @@
 import type { StateDb } from "../state/db.js";
 import type { WorkflowRun } from "../state/workflow-run-store.js";
 import type { GitHubClient } from "./github/github.js";
-import type { CiFailureReport } from "./github/github.js";
+import type { CiFailureReport, PrDiscussionRead } from "./github/github.js";
 import type { SpecLinkedIssue } from "./review-spec.js";
 import { prFixShapedWorkflows } from "../workflows/target-policy.js";
 import { prScopedWorkflows } from "../workflows/pr-scope.js";
@@ -205,6 +205,13 @@ export interface PrState {
    */
   settledCheckCount: number;
   /**
+   * ISO time the head's CI has been pending since (the oldest still-pending
+   * check), or `null` when it is not pending or the read carried no timestamp.
+   * The one thing that lets the review sweep tell "CI is still running" from
+   * "this check will never conclude" (`review.sweepPendingGraceMinutes`).
+   */
+  checksPendingSince: string | null;
+  /**
    * Check state of the BASE branch tip — the sole signal for `upstream-broken`.
    * A live precondition, never a stored verdict: see `resolveFixDisposition`.
    */
@@ -277,6 +284,14 @@ export interface PrState {
    * what was missing was any projection of it into a prompt (§E2).
    */
   closes: SpecLinkedIssue[];
+  /**
+   * The PR's prior conversation — reviews, inline threads (resolved or not),
+   * top-level comments — for the `sites` engine's `select`, which dedupes
+   * against it. `null` until {@link resolveSpecContext} fills it (only with
+   * `review.analysis.enabled`, for the reason {@link closes} gives), and `null`
+   * when the read failed: "we could not look" is not "nobody said anything".
+   */
+  discussion: PrDiscussionRead | null;
   /**
    * The paths this PR changes — the CANDIDATE SET that is the second end of
    * every `spec` obligation, and the reason that family does not violate locked
@@ -481,7 +496,16 @@ export interface PrState {
    * A PR-scoped run already in flight, or null. The lock is across EVERY
    * PR-scoped workflow, not per family (09 → S4).
    */
-  runInFlight: { workflow: string; runId: string } | null;
+  runInFlight: {
+    workflow: string;
+    runId: string;
+    /**
+     * The head SHA that run was dispatched against (its context's `headSha`),
+     * or `null` when the row does not record one. A `pr-review` run reviewing
+     * an OLDER head than the PR's current one is what `supersedes` replaces.
+     */
+    headSha?: string | null;
+  } | null;
   /**
    * The GitHub reads that failed while resolving, if any.
    *
@@ -595,6 +619,7 @@ export async function resolvePrState(
     body: "",
     checksState: "none",
     settledCheckCount: 0,
+    checksPendingSince: null,
     baseChecksState: "none",
     botReviewAtHead: null,
     lastBotReview: null,
@@ -604,6 +629,7 @@ export async function resolvePrState(
     // Both stay at their "not read" values unless `resolveSpecContext` is
     // called — see their field docs, and locked decision 8.
     closes: [],
+    discussion: null,
     changedFiles: null,
     attempt: 1,
     flakyDeferrals: 0,
@@ -687,6 +713,7 @@ export async function resolvePrState(
       if (summary) {
         state.checksState = summary.state;
         state.settledCheckCount = summary.settledCount;
+        state.checksPendingSince = summary.pendingSince ?? null;
       }
       state.baseChecksState = baseState;
       state.botReviewAtHead = review.atHead
@@ -769,7 +796,7 @@ export async function resolvePrState(
  * **A separate, opt-in step rather than part of {@link resolvePrState}**, and
  * the split is the whole design:
  *
- * - It costs two live reads (one GraphQL, one REST) that nothing needed before
+ * - It costs three live reads (two GraphQL, one REST) that nothing needed before
  *   WP0, and `resolvePrState` runs on every PR-scoped dispatch on every route.
  *   Folding them in would spend them on `pr-fix` and the dependency crons, which
  *   read neither.
@@ -804,7 +831,7 @@ export async function resolveSpecContext(
     log.warn("Read failed", { repo: state.repo, prNumber: state.prNumber, what, err });
   };
 
-  const [closes, changedFiles] = await Promise.all([
+  const [closes, changedFiles, discussion] = await Promise.all([
     github.listPullRequestClosingIssues(owner, name, state.prNumber).catch((err: unknown) => {
       note("listPullRequestClosingIssues", err);
       // `[]`, not a throw: a PR genuinely linked to nothing is the common case,
@@ -815,6 +842,16 @@ export async function resolveSpecContext(
       note("listPullRequestFilePaths", err);
       return null;
     }),
+    // Through `.then` so even a SYNCHRONOUS throw (a structural client that
+    // lacks the method — the evals harness's port predates it) lands in the
+    // catch rather than rejecting the whole `Promise.all` and losing the two
+    // spec reads above with it.
+    Promise.resolve()
+      .then(() => github.getPullRequestDiscussion(owner, name, state.prNumber))
+      .catch((err: unknown) => {
+        note("getPullRequestDiscussion", err);
+        return null;
+      }),
   ]);
 
   state.closes = closes.map((i) => ({
@@ -825,6 +862,7 @@ export async function resolveSpecContext(
     state: i.state,
   }));
   state.changedFiles = changedFiles;
+  state.discussion = discussion;
 }
 
 /**
@@ -840,7 +878,14 @@ export async function applyDerivedState(state: PrState, deps: PrStateDeps): Prom
   const triggerId = prTriggerId(state.repo, state.prNumber);
 
   const inFlight = await deps.db.runs.activeForTrigger(prScoped, triggerId);
-  state.runInFlight = inFlight ? { workflow: inFlight.workflowName, runId: inFlight.id } : null;
+  const inFlightHead = (inFlight?.context as Record<string, unknown> | undefined)?.headSha;
+  state.runInFlight = inFlight
+    ? {
+        workflow: inFlight.workflowName,
+        runId: inFlight.id,
+        headSha: typeof inFlightHead === "string" && inFlightHead ? inFlightHead : null,
+      }
+    : null;
 
   const lifetimeCostUsd = await deps.db.executions.costForTriggerWorkflows(triggerId, family);
 

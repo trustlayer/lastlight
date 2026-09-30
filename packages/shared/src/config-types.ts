@@ -265,43 +265,6 @@ export function coerceProbeMode(raw: unknown): ProbeMode {
 }
 
 /**
- * What `adjudicate` reads and what it writes. See
- * {@link ReviewAnalysisConfig.adjudicate}.
- *
- * Three literals rather than a boolean because this selects a PHASE SHAPE.
- * `"jev"` is the third value this type's doc comment predicted — a per-row
- * System-1 classifier over the same dossier
- * ([#399](https://github.com/nearform/lastlight/issues/399) idea 2) — built
- * and measured 2026-09-22: 260 hypotheses across an 8-case arm, 83.6%
- * agreement with a Sonnet adjudicate call on the identical dossier evidence,
- * for $0.0053. It **implies** `"dossier"` (the rendering and the typed
- * `claim`/`category`/`fix` output are unchanged) and additionally runs
- * `jev-classify`, whose per-hypothesis category is rendered into the dossier
- * as an ADVISORY line — Sonnet still writes every disposition itself. Not a
- * replacement of the adjudicator: the measured agreement is weakest exactly
- * on the rarest, highest-stakes categories (`defect` 33%, `correctness-risk`
- * 40% recall against Sonnet's own call), so nothing here skips or overrides
- * Sonnet's judgement yet. `obligationContract` has the same three-value shape
- * for the same reason (a phase shape, not a flag).
- */
-export type AdjudicateMode = "legacy" | "dossier" | "jev";
-
-/**
- * Read an operator's `adjudicate` value. **Total**, and it fails toward the
- * shipped phase.
- *
- * Only the literals `"dossier"` and `"jev"` move a deployment. A bare `true`
- * does NOT — unlike {@link coerceProbeMode}, where `true` meant something
- * specific historically, nothing has ever written `adjudicate: true`, so
- * there is no compatibility to preserve and no reason to let a truthy-ish
- * value select an unmeasured phase shape.
- */
-export function coerceAdjudicateMode(raw: unknown): AdjudicateMode {
-  if (raw === "jev") return "jev";
-  return raw === "dossier" ? "dossier" : "legacy";
-}
-
-/**
  * How much automation a trigger mode buys, ascending — the scale the repo-layer
  * clamp takes the minimum on.
  *
@@ -387,9 +350,9 @@ export interface ReviewAnalysisConfig {
    */
   maxObligations: number;
   /**
-   * Which obligation BLOCK the six survey families are handed — the CONTROL for
-   * 2026-08-23, and the only key in this block that exists to make a result
-   * readable rather than to buy compute.
+   * Which obligation contract `lastlight-facts seed` records — the CONTROL for
+   * 2026-08-23, measured on the (since removed) agent survey. Today it only
+   * changes how strictly the `discharge` post-check in `units-ingest` grades.
    *
    * `full` (the default) is that day's block: a mandatory discharge contract
    * with a `discharge` field to record a code in, an un-truncated id checklist,
@@ -406,45 +369,14 @@ export interface ReviewAnalysisConfig {
    * same obligations, delivered just as reliably, asking the old question — so
    * one arm separates them.
    *
-   * It reaches the five facts-derived families as `lastlight-facts seed
-   * --contract`, is stamped into `obligations.json`, and the `spec` family reads
-   * it directly (`renderSpecObligations`) because it is rendered harness-side.
+   * It reaches the seeder as `lastlight-facts seed --contract` and is stamped
+   * into `obligations.json`.
    * **`lastlight-facts discharge` degrades to its `test -s` floor under
    * `minimal`**: measured compliance under that block was 0/31, 0/34 and 0/40,
    * so a gate demanding a code the block never asked for would fail every family
    * of every run.
    */
   obligationContract: "full" | "minimal";
-  /**
-   * What `adjudicate` is handed, and what shape it writes back.
-   *
-   * - `legacy` — the shipped phase. The prompt names the files and the model
-   *   shells out to assemble them, then writes a `tier` and a `confidence` per
-   *   finding.
-   * - `dossier` — a deterministic `dossier` phase renders every record the
-   *   phase needs (`lastlight-facts dossier`) and the harness attaches it, and
-   *   the model writes typed ATTRIBUTES (`claim` / `category` / `fix`) from
-   *   which a pure `computeTier()` derives the tier. `confidence` is not asked
-   *   for.
-   *
-   * **One key for both halves on purpose.** They change the same phase's
-   * measured surface — its input and its output — so shipping them together
-   * costs ONE comparability break with the archive instead of two, and one arm
-   * validates both. Splitting them would buy a second baseline nobody wants.
-   *
-   * What it is fixing, measured on the 8-case probes arm: `adjudicate` spends
-   * **137 bash calls across 8 adjudications** (35 turns / 30 bash on the
-   * stress case) re-deriving records the harness already holds — about a third
-   * of case cost — and then makes its actual judgement at the end of a long,
-   * noisy transcript, which is the condition under which every measured
-   * failure of this phase has happened. See
-   * [#399](https://github.com/nearform/lastlight/issues/399).
-   *
-   * Defaults to `legacy`, and an unrecognised value lands there too: the same
-   * direction every switch in this block fails. No deployment changes
-   * behaviour until an operator asks and an arm has measured it.
-   */
-  adjudicate: AdjudicateMode;
   /**
    * Which D2 minting arms `lastlight-facts seed` runs, as a comma-list over
    * `all-in-diff` (contract obligations for symbols whose every reference is
@@ -465,35 +397,34 @@ export interface ReviewAnalysisConfig {
    */
   mint: string;
   /**
-   * How many of the six survey families actually run.
-   *
-   * **Six, and the default is not negotiable down without saying which.** The
-   * previous design defaulted this to 3 against six families and never recorded
-   * which three ran — so half the families silently never executed, and
-   * `enforcement`, the one that produced the only gold match, could have been
-   * among them (§D4). A value below 6 takes the families in the seeder's rank
-   * order and the run says so in its artifact.
-   */
-  surveyPasses: number;
-  /**
-   * How many survey families run CONCURRENTLY (WP11c).
+   * How many `site-review` investigators run CONCURRENTLY.
    *
    * A CEILING, not a guarantee: the run clamps it to what the active sandbox
    * backend can actually hold. `none` and `docker` take the declared value;
    * `gondolin` boots a QEMU micro-VM per agent session inside the harness
-   * process and pins to 1, as do `smol` and `kubernetes` until measured. So on
-   * a stock deployment (gondolin) this key changes nothing at all today.
-   *
-   * Six by default because six is what the fan-out exists for. The six families
-   * write six disjoint append-only files and never read each other's, so there
-   * was never an ordering constraint between them — only a scheduler that ran
-   * one DAG node at a time. Chained, they were 851s of a 29-minute review (49%
-   * of the wall clock); concurrent, they are the slowest single family.
+   * process and pins to 1, as does `smol` until measured. So on a stock
+   * deployment (gondolin) this key changes nothing at all today.
    *
    * Lower it to bound provider rate-limit pressure or memory, not to bound
-   * spend: the six passes cost the same in tokens either way.
+   * spend: the investigators cost the same in tokens either way. Read from the
+   * config as `siteConcurrency`, or its old name `surveyConcurrency` (the agent
+   * survey fan-out it used to bound is gone).
    */
-  surveyConcurrency: number;
+  siteConcurrency: number;
+  /**
+   * How many vote-ranked sites get an investigator, 1–8 (`lastlight-facts
+   * sites --plan --top`). Measured on the 18 Martian cases' surveys
+   * (docs/plans/pr-review-units-sites.md, H3 audit): top 5 put 16 of the 25
+   * gold-mapped rows inside a selected site, top 8 put 21, for ~2 more sites
+   * per PR. Values outside 1–8 fall back to the default.
+   */
+  siteTop: number;
+  /**
+   * How many unit calls `survey-units` keeps in flight at once. No backend
+   * clamp: the calls are in-process HTTP requests, not sandboxes, so this
+   * bounds provider rate-limit pressure and nothing else.
+   */
+  surveyUnitConcurrency: number;
   /**
    * WP4 — the `prepare` + `falsify` pair: prepare the probe environment, then
    * write probes and run them. **Tri-state**, and the middle value is the point.
@@ -582,6 +513,16 @@ export interface ReviewAnalysisConfig {
    */
   falsifyTimeoutSeconds: number;
   /**
+   * WHOLE-PHASE deadline on `survey-units`, in seconds.
+   *
+   * The in-process handler runs every unit call under one `AbortController`
+   * armed for this long; a unit not finished by then is recorded `ok: false`
+   * with the error `phase deadline` (and appears in the transcript), and the
+   * phase still succeeds — `units-ingest` records the gap. Read by the phase as
+   * `timeout_seconds: { from: surveyUnitsTimeoutSeconds }`.
+   */
+  surveyUnitsTimeoutSeconds: number;
+  /**
    * How many rounds `falsify` gets to write and run probes.
    *
    * Two. v3's lesson 3 is the sizing argument: the loop's exit condition is a
@@ -589,6 +530,17 @@ export interface ReviewAnalysisConfig {
    * overkill and cost 2.4× for a worse result.
    */
   probeRounds: number;
+  /**
+   * At most this many hypotheses are put in front of `falsify`, `null` for no
+   * cap. `lastlight-facts probe-plan` ranks the owed set (derived Critical
+   * first, then a survey's own ask) and cuts it here. Inert while falsify is
+   * not attached (docs/plans/pr-review-units-sites.md, stage 5).
+   *
+   * Eight, provisionally. Under the unit survey 20–33 rows per case were owed,
+   * which no single oracle session in one round gets through. The micro-falsify
+   * eval is what should move this number.
+   */
+  maxProbes: number | null;
   /**
    * The inline-comment attention budget (WP6b).
    *
@@ -653,19 +605,6 @@ export interface ReviewAnalysisConfig {
    * explicitly instead of inheriting whatever it currently is.
    */
   maxBodyComments: number | null;
-  /**
-   * The TypeSafe model id `jev-classify` calls, under `adjudicate: "jev"`.
-   * `null` ⇒ the CLI's own default (`TYPESAFE_MODEL` env, else `jev-latest`) —
-   * kept out of the `models:` map because TypeSafe is a separate provider
-   * from the `provider/model` chat models that map resolves, and conflating
-   * them would let an unrelated key silently redirect a model call nothing
-   * else reads.
-   */
-  jevModel: string | null;
-  /** Phase budget for `jev-classify`, in seconds. Cheap and fast per call (a
-   * TypeSafe `systemOne` round trip is ~100ms), but the phase makes one call
-   * per hypothesis and a case can carry dozens. */
-  jevTimeoutSeconds: number;
 }
 
 /**
@@ -682,6 +621,33 @@ export interface ReviewAnalysisConfig {
 export interface ReviewConfig {
   /** Post the `last-light/review` Check Run. */
   postsCheck: boolean;
+  /**
+   * With `postsCheck` on, also post the PLACEHOLDER check a deferred review
+   * leaves behind — `queued` while `after-checks` waits for CI, `neutral` while
+   * `on-request` waits for a human. `false` means the check appears only when a
+   * review actually DISPATCHES (and then concludes from the run), so under
+   * `after-checks` nothing of ours shows on a PR until its CI has settled.
+   *
+   * Off is for a deployment that wants the in-progress/verdict signal but not a
+   * Last Light check sitting in the list before CI has even run. The cost: a
+   * branch-protection rule requiring `last-light/review` has nothing to wait on
+   * until the review starts, and `on-request` loses the Re-run-button request
+   * affordance. Operator-only.
+   */
+  placeholderCheck: boolean;
+  /**
+   * How long a head's CI must have been PENDING before the review sweep stops
+   * waiting for it and reviews anyway, in minutes.
+   *
+   * The sweep is the release valve for a check that never concludes (a dead
+   * runner, a fork workflow awaiting approval), so it cannot defer on `pending`
+   * forever. But without a grace window it dispatched a review two minutes
+   * after a push, mid-CI, on whichever :00/:30 tick came next — the opposite of
+   * `after-checks`. `0` restores that. Dated from the oldest still-pending check
+   * (`PrState.checksPendingSince`); when that cannot be read the sweep
+   * dispatches, as before. Operator-only.
+   */
+  sweepPendingGraceMinutes: number;
   /** Which trigger mode this deployment/repo uses. */
   trigger: ReviewTrigger;
   /** Label that requests a review in `on-request` mode. `null` = no label route. */
@@ -811,7 +777,7 @@ export type ReviewAnalysisDurationKey =
   | "seedTimeoutSeconds"
   | "reconcileTimeoutSeconds"
   | "falsifyTimeoutSeconds"
-  | "jevTimeoutSeconds";
+  | "surveyUnitsTimeoutSeconds";
 
 /**
  * A {@link ReviewConfig} WITHOUT its duration leaves (`triage.timeoutSeconds`
@@ -836,6 +802,8 @@ export type ReviewPolicy = Omit<ReviewConfig, "triage" | "analysis"> & {
 export function defaultReviewPolicy(): ReviewPolicy {
   return {
     postsCheck: false,
+    placeholderCheck: true,
+    sweepPendingGraceMinutes: 60,
     trigger: "after-checks",
     requestLabel: null,
     skipDraft: true,
@@ -879,21 +847,18 @@ export function defaultReviewPolicy(): ReviewPolicy {
       // remains the opt-in telemetry arm (discharge codes + the
       // clean-discharge demotion at the posting boundary).
       obligationContract: "minimal",
-      // `dossier` measured 2026-09-22 (mechanism confirmed; posted-recall
-      // guardrail inconclusive on n=1 — repeats pending). `jev` built and
-      // screened the same day (83.6% agreement with Sonnet, $0.0053) but not
-      // yet compared against gold. Neither has an arm behind it yet. See the
-      // field's doc.
-      adjudicate: "legacy",
       // Both D2 rules — the measured shipped shape. See the field's doc.
       mint: "all-in-diff,registrations",
-      surveyPasses: 6,
-      surveyConcurrency: 6,
+      siteConcurrency: 6,
+      siteTop: 5,
+      surveyUnitConcurrency: 16,
       probes: "off",
       probeLifecycleScripts: false,
       probeTypecheck: false,
       probeCoverage: false,
       probeRounds: 2,
+      // Provisional. See the field's doc.
+      maxProbes: 8,
       // Five, down from ten (issue #405): the rank it spends is now a derived
       // severity that varies, so a lower ceiling keeps the strongest claims
       // rather than cutting at random. See the field's doc.
@@ -906,9 +871,6 @@ export function defaultReviewPolicy(): ReviewPolicy {
       // compromise; `null` restores the legacy unlimited funnel. See the
       // field's doc.
       maxBodyComments: 5,
-      // `null` ⇒ jev-classify's own default (TYPESAFE_MODEL env, else
-      // jev-latest). Inert unless `adjudicate: "jev"`.
-      jevModel: null,
     },
   };
 }

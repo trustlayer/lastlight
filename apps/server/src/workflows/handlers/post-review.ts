@@ -1,6 +1,5 @@
 import { execFileSync } from "node:child_process";
 import {
-  existsSync,
   readdirSync,
   readFileSync,
   statSync,
@@ -34,6 +33,7 @@ import {
 import { logger } from "../../logging/logger.js";
 import { chat, type ChatFunction } from "../../engine/llm.js";
 import { writePostedSummary } from "../../engine/github/review-summary.js";
+import { resolveHostRepoDir } from "./host-repo-dir.js";
 
 const log = logger("post-review");
 import type { ExecutorConfig } from "lastlight-workflow-engine";
@@ -79,6 +79,55 @@ export interface PostReviewRunScope {
  * that mutates the process env in future. Exported for the concurrent-clear
  * regression test.
  */
+/**
+ * Is this a re-review — of a head the author has MOVED since our last review?
+ * An explicit `@bot review` of the head we already reviewed is not: nothing
+ * was pushed, so there are no "updates" to thank them for. A failed history
+ * read leaves `latest` null, which reads as a first review — the plainer wording.
+ */
+export function isRereview(latest: { sha: string } | null, headSha: string | undefined | null): boolean {
+  return latest !== null && !!headSha && latest.sha !== headSha;
+}
+
+/**
+ * Does an earlier review of ours still have an open inline thread on code
+ * this head did not change? A clean re-review must not say "good to merge"
+ * over one: `select` only marks a prior point `alreadyRaised` when a site
+ * re-finds it this round, and the carried ledger is absent on the sites
+ * pipeline, so a prior finding nobody re-grounded is otherwise invisible.
+ *
+ * An OUTDATED thread does not count: the code it sat on changed, and this
+ * review — which read the new code — found nothing to raise there. A failed
+ * read counts as open, and so does a TRUNCATED one with no open thread in the
+ * page it holds: the threads it could not see are unknown, not closed. The
+ * claim that needs the evidence is the one withheld.
+ *
+ * Every posted thread counts, whatever its label: the sites pipeline never
+ * posts a `nit` (finalize files it `internal`), so a posted thread is
+ * `must-fix` or `worth-mentioning` — the same bar `hasStillOpen` holds.
+ */
+export async function openBotThreads(
+  github: Pick<GitHubClient, "getPullRequestDiscussion">,
+  owner: string,
+  repo: string,
+  prNumber: number,
+  botLogin = getRuntimeConfig()?.botLogin ?? "last-light[bot]",
+): Promise<boolean> {
+  // GraphQL names a Bot without REST's `[bot]` suffix.
+  const bot = botLogin.replace(/\[bot\]$/, "");
+  try {
+    const d = await github.getPullRequestDiscussion(owner, repo, prNumber);
+    const open = d.threads.some((t) => {
+      const first = t.comments[0];
+      return !t.isResolved && !t.isOutdated && !!first?.isBot && first.author === bot;
+    });
+    return open || d.threadsTruncated;
+  } catch (err: unknown) {
+    log.warn("Could not read review threads — not calling the re-review good to merge", { owner, repo, prNumber, err });
+    return true;
+  }
+}
+
 export function resolveReviewGitHubClient(runConfig: {
   githubApiBaseUrl?: string;
 }): GitHubClient {
@@ -639,18 +688,39 @@ export class GitHubPostReviewHandler implements PhaseTypeHandler {
     const clean = boundary
       ? readCleanDischarges(join(hostRepoDir, ".lastlight", "pr-review"))
       : undefined;
+    // An INCOMPLETE document (the conservation floor wrote it because the
+    // adjudicator never did) is not a review. Its own summary — which says the
+    // change was not assessed — is what posts, with the reason, on every
+    // branch below; the posted-findings summary is never written for it,
+    // because with nothing posted that summary is "No issues to raise."
+    const incomplete = incompleteSummary(doc);
+    if (incomplete !== undefined) {
+      log.warn("findings.json is marked incomplete — posting its not-assessed summary, never a clean one", {
+        repo: `${owner}/${repo}`,
+        prNumber,
+        phase: doc.incomplete?.phase,
+        reason: doc.incomplete?.reason,
+      });
+      doc = { ...doc, summary: incomplete };
+    }
     let review = buildReview(doc, commentable, boundary, clean);
     // Issue #405: under a boundary the summary is written AFTER the caps, from
     // the posted findings only — the adjudicator's summary was written before
     // them and routinely named findings the boundary then withheld, which
     // posted them anyway. See `review-summary.ts`.
     let postedSummary: string | undefined;
-    if (boundary && review.tiered) {
+    if (boundary && review.tiered && incomplete !== undefined) {
+      postedSummary = incomplete;
+      review = withSummary(review, incomplete);
+    } else if (boundary && review.tiered) {
+      const rereview = isRereview(history.latest, headSha);
       const summary = await writePostedSummary({
         event: review.event,
         tiered: review.tiered,
-        adjudicatorSummary: doc.summary,
+        documentSummary: doc.summary,
         prTitle: typeof ctx.prTitle === "string" && ctx.prTitle ? ctx.prTitle : undefined,
+        rereview,
+        priorOpen: rereview ? await openBotThreads(github, owner, repo, prNumber) : false,
         model: this.run.modelFor?.("review-summary"),
         chat: this.run.chat ?? chat,
       });
@@ -863,20 +933,9 @@ export class GitHubPostReviewHandler implements PhaseTypeHandler {
     return summary;
   }
 
-  /** Host path of the run's repo checkout — mirrors sandbox/index.ts layout. */
+  /** Host path of the run's repo checkout — see {@link resolveHostRepoDir}. */
   private resolveHostRepoDir(repo: string): string {
-    const config = this.run.config;
-    const sandboxBase = resolve(
-      config.sandboxDir || join(config.stateDir || "data", "sandboxes"),
-    );
-    const workDir = join(sandboxBase, this.run.taskId);
-    // pr-review pre-clones into a `<repo>/` subdir (a sibling of the workspace
-    // root's AGENTS.md / skill bundle). Fall back to the workspace root if the
-    // repo subdir has no findings (defensive — should not happen for pr-review).
-    const repoDir = join(workDir, repo);
-    if (existsSync(join(repoDir, ".lastlight", "pr-review"))) return repoDir;
-    if (existsSync(join(workDir, ".lastlight", "pr-review"))) return workDir;
-    return repoDir;
+    return resolveHostRepoDir(this.run.config, this.run.taskId, repo);
   }
 
   /**
@@ -1179,4 +1238,18 @@ export function makePostReviewHandler(
   reporter: PhaseReporter,
 ): PhaseTypeHandler {
   return new GitHubPostReviewHandler(run, reporter);
+}
+
+/**
+ * The summary an INCOMPLETE findings document posts: its own summary (the
+ * floor writes one saying the change was not assessed), then the reason, or
+ * `undefined` for a complete document. A missing or empty summary still posts
+ * as not-assessed — never as nothing.
+ */
+export function incompleteSummary(doc: ReviewFindingsDoc): string | undefined {
+  if (!doc.incomplete) return undefined;
+  const own = typeof doc.summary === "string" ? doc.summary.trim() : "";
+  const summary = own || "This review did not complete, so the change was not assessed. This is not a clean review.";
+  const reason = typeof doc.incomplete.reason === "string" ? doc.incomplete.reason.trim() : "";
+  return reason && !summary.includes(reason) ? `${summary}\n\nWhy: ${reason}.` : summary;
 }

@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { getWorkflow, loadPromptTemplate } from "#src/workflows/loader.js";
-import { renderTemplate } from "lastlight-workflow-engine";
+import { phaseSkipIfExpressions, renderTemplate } from "lastlight-workflow-engine";
 import type { PhaseDefinition, TemplateContext } from "lastlight-workflow-engine";
 import type { PrState } from "#src/engine/pr-state.js";
 import { renderContext, STATIC_PREPARE_BUDGET_SECONDS } from "#src/engine/pr-decisions.js";
@@ -199,6 +199,8 @@ describe("every pr-review phase budget comes from config (#385)", () => {
     expect(phase("facts")?.timeout_seconds).toEqual({ from: "factsTimeoutSeconds" });
     expect(phase("seed")?.timeout_seconds).toEqual({ from: "seedTimeoutSeconds" });
     expect(phase("reconcile")?.timeout_seconds).toEqual({ from: "reconcileTimeoutSeconds" });
+    // The in-process unit survey's WHOLE-PHASE deadline (its AbortController).
+    expect(phase("survey-units")?.timeout_seconds).toEqual({ from: "surveyUnitsTimeoutSeconds" });
   });
 
   it("projects those keys from the resolved review block whenever the pipeline runs", () => {
@@ -207,6 +209,7 @@ describe("every pr-review phase budget comes from config (#385)", () => {
     expect(ctx.factsTimeoutSeconds).toBe(String(review.analysis.factsTimeoutSeconds));
     expect(ctx.seedTimeoutSeconds).toBe(String(review.analysis.seedTimeoutSeconds));
     expect(ctx.reconcileTimeoutSeconds).toBe(String(review.analysis.reconcileTimeoutSeconds));
+    expect(ctx.surveyUnitsTimeoutSeconds).toBe(String(review.analysis.surveyUnitsTimeoutSeconds));
     expect(ctx.triageTimeoutSeconds).toBe(String(review.triage.timeoutSeconds));
   });
 });
@@ -489,15 +492,15 @@ describe("falsify — the loop, its gate, and the rule with money on it", () => 
     expect(falsify!.model).toBe(FALSIFY_MODEL);
   });
 
-  it("uses the explicit `{{#if}}` PAIR, exactly as `adjudicate` does", () => {
+  it("uses the explicit `{{#if}}` PAIR, exactly as `site-review` does", () => {
     // Load-bearing and already measured once: a bare unset
     // `{{models.review-falsify}}` renders EMPTY, and an empty model resolves to
-    // the DEFAULT model rather than to the intended fall-through. The
-    // adjudicate case cost a scorecard that recorded literal `{{#if …}}`
-    // residue as `PhaseMetric.model`.
-    const adjudicateModel = byName.get("adjudicate")?.model ?? "";
-    expect(adjudicateModel).toContain("{{#if models.review-adjudicate}}");
-    expect(adjudicateModel).toContain("{{#if !models.review-adjudicate}}");
+    // the DEFAULT model rather than to the intended fall-through. It once cost
+    // a scorecard that recorded literal `{{#if …}}` residue as
+    // `PhaseMetric.model`.
+    const siteModel = byName.get("site-review")?.model ?? "";
+    expect(siteModel).toContain("{{#if models.review-site}}");
+    expect(siteModel).toContain("{{#if !models.review-site}}");
     expect(falsify!.model).toContain("{{#if models.review-falsify}}");
     expect(falsify!.model).toContain("{{#if !models.review-falsify}}");
     expect(falsify!.model).not.toBe("{{models.review-falsify}}");
@@ -540,8 +543,7 @@ describe("falsify — the loop, its gate, and the rule with money on it", () => 
   it("runs under `static` — the oracle never needed the install", () => {
     // Its prompt was already written for a tree with no dependencies on it:
     // it reads `installed` off `env.json`, records what it cannot run as
-    // `unprobed` with a reason, and those hypotheses survive to adjudication.
-    // The only thing keeping it out of the zero-install world was the shared
+    // `unprobed` with a reason. The only thing keeping it out of the zero-install world was the shared
     // gate, and that was an accident of gating rather than a constraint.
     expect(falsify!.skip_if).toContain("probesEnabled != true");
     expect(contextFor(STATIC).probesEnabled).toBe("true");
@@ -557,15 +559,22 @@ describe("falsify — the loop, its gate, and the rule with money on it", () => 
     );
   });
 
-  it("sits between the survey fan-out and the review, on `all_done`", () => {
-    // Between, because it consumes what the surveys wrote; `all_done`, because
-    // it skips on every deployment without probes and a skipped node is not
-    // `succeeded` — with `all_success` the review itself would vanish.
-    // WP11c: the six chained survey phases became one `survey` fan-out node,
-    // so the edge that used to name the LAST family now names the whole node.
-    expect(falsify!.depends_on).toEqual(["survey"]);
+  it("is kept but NOT attached — its own guard, which no code projects", () => {
+    // docs/plans/pr-review-units-sites.md, D2 (c): nothing in the sites
+    // engine reads falsify's verdicts yet, so the three phases skip on a key
+    // `renderContext` never sets, whatever `probes` says — no deployment pays
+    // for probes nobody reads. Wiring them back is its own measured change.
+    for (const name of ["prepare", "probe-plan", "falsify"]) {
+      expect(phaseSkipIfExpressions(byName.get(name)!), name).toContain("falsifyAttached != true");
+    }
+    expect(contextFor(STATIC).falsifyAttached).toBeUndefined();
+    // `all_done` down its chain, so a skip never cascades onto `review`.
+    expect(byName.get("probe-plan")?.depends_on).toEqual(["units-ingest"]);
+    expect(byName.get("probe-plan")?.trigger_rule).toBe("all_done");
+    expect(falsify!.depends_on).toEqual(["probe-plan"]);
     expect(falsify!.trigger_rule).toBe("all_done");
-    expect(byName.get("review")?.depends_on).toEqual(["falsify"]);
+    expect(byName.get("review")?.depends_on).toEqual(["site-finalize", "falsify"]);
+    expect(byName.get("review")?.trigger_rule).toBe("all_done");
   });
 
   it("degrades rather than fails when a probe round goes wrong", () => {
@@ -574,20 +583,10 @@ describe("falsify — the loop, its gate, and the rule with money on it", () => 
     // `{ retries: 0, then: "fail" }` — one degenerate turn then hard-fails the
     // whole review, which records no `assessedHeadShaByWorkflow` and hands
     // `cron-review.yaml` something to re-dispatch every thirty minutes forever.
-    // All six survey phases had it in the wrong place until this test was
-    // written; assert the LOCATION, not just the value.
+    // The (since removed) survey phases had it in the wrong place until this
+    // test was written; assert the LOCATION, not just the value.
     expect((falsify as Record<string, unknown>).on_soft_failure).toBeUndefined();
     expect(falsify!.generic_loop?.on_soft_failure).toEqual({ retries: 1, then: "complete" });
-  });
-
-  it("…and so does every survey phase, for the same reason", () => {
-    for (const phase of def.phases.filter((p) => p.name.startsWith("survey_"))) {
-      expect((phase as Record<string, unknown>).on_soft_failure, phase.name).toBeUndefined();
-      expect(phase.generic_loop?.on_soft_failure, phase.name).toEqual({
-        retries: 1,
-        then: "complete",
-      });
-    }
   });
 });
 
@@ -655,7 +654,7 @@ describe("the falsify prompt carries the constraints, not just the task", () => 
     expect(prompt).toMatch(/If you executed nothing, the verdict is `unprobed`/i);
     // …and that it costs the finding nothing, which is what keeps the gate
     // satisfiable honestly rather than pushing the pass into a fabrication.
-    expect(prompt).toMatch(/survives to\s+adjudication at lowered confidence/i);
+    expect(prompt).toMatch(/survives at\s+lowered confidence/i);
     expect(prompt).toMatch(/first line/i);
   });
 

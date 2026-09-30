@@ -67,7 +67,7 @@ import {
 } from "lastlight-core/evals";
 
 /**
- * The two reads `resolveSpecContext` makes. Declared structurally so the fake
+ * The reads `resolveSpecContext` makes. Declared structurally so the fake
  * only has to satisfy what is actually called — the same reasoning that lets a
  * `FakeGitHub` stand in as a `GitHubClient` for `fetchRepoConfigTree`.
  */
@@ -82,6 +82,8 @@ export interface SpecGitHub {
     repo: string,
     pullNumber: number,
   ) => Promise<string[] | null>;
+  /** The PR's prior conversation, for `select`. Optional: core tolerates a port without it. */
+  getPullRequestDiscussion?: (owner: string, repo: string, pullNumber: number) => Promise<unknown>;
 }
 
 /** One failing CI job, as a case writes it. */
@@ -198,6 +200,14 @@ export function buildPrState(args: {
   seed?: PrStateSeed;
   /** Harness-derived changed paths; the case's own seed beats it. See {@link prContextPatch}. */
   changedFiles?: string[];
+  /**
+   * The PR's base branch from the instance (`pr.base_ref`); the case's own
+   * `pr_state.base_ref` beats it. Without it every case read `"main"`, and
+   * `renderContext` projects `baseBranch` from this snapshot OVER the one the
+   * harness set — so a `master`-based PR (sentry) had post-review diff against
+   * an `origin/main` that does not exist, and every finding went to the body.
+   */
+  baseRef?: string;
 }): PrState {
   const s = args.seed ?? {};
   const at = new Date().toISOString();
@@ -216,7 +226,7 @@ export function buildPrState(args: {
     authorLogin: "dependabot[bot]",
     authorIsOurs: false,
     headRef: s.head_ref ?? args.branch,
-    baseRef: s.base_ref ?? "main",
+    baseRef: s.base_ref ?? args.baseRef ?? "main",
     isDraft: s.is_draft ?? false,
     isFork: s.is_fork ?? false,
     headRepoFullName: args.repo,
@@ -225,6 +235,7 @@ export function buildPrState(args: {
     body: args.body,
     checksState: s.checks_state ?? CHECKS_DEFAULT,
     settledCheckCount: s.settled_check_count ?? 0,
+    checksPendingSince: null,
     baseChecksState: s.base_checks_state ?? CHECKS_DEFAULT,
     botReviewAtHead: null,
     // No prior posted review, so the generated-only re-review gate (issue #271)
@@ -247,6 +258,10 @@ export function buildPrState(args: {
       ...(c.state ? { state: c.state } : {}),
       ...(c.url ? { url: c.url } : {}),
     })),
+    // Filled by core's `resolveSpecContext` when the harness hands it a client
+    // (the fake serves the discussion query from the case's seeded reviews and
+    // comments); null otherwise — "not read", never "nobody said anything".
+    discussion: null,
     // `??`, not `||`: a case seeding `[]` is asserting "this PR changes no
     // files", which is a different fact from "we could not read the list" and
     // yields a different degraded message. Only a genuinely absent seed falls
@@ -350,6 +365,8 @@ export async function prContextPatch(args: {
   body: string;
   branch: string;
   seed?: PrStateSeed;
+  /** The instance's `pr.base_ref` — see {@link buildPrState}. */
+  baseRef?: string;
   /**
    * A `GitHubClient` pointed at the fake — the seam that makes the `spec` axis
    * production-shaped.

@@ -307,9 +307,13 @@ src/
     handlers/           App-registered phase types, injected on
                         `EnginePorts.handlers` so the runtime-agnostic
                         engine needs no knowledge of GitHub or sandboxes:
-                        `post-review.ts` (in-process review submission) and
+                        `post-review.ts` (in-process review submission),
                         `fanout.ts` (N concurrent agent sessions in ONE
-                        provisioned workspace). NOT to be confused with
+                        provisioned workspace) and `survey-units.ts` (the
+                        per-unit review survey — one bounded model call per
+                        unit from the harness, no sandbox; the survey of
+                        the `review.analysis` evidence pipeline).
+                        NOT to be confused with
                         `src/cron/fanout.ts`, which fans a cron out over
                         repos.
   sandbox/              Isolation backends for agent runs. One container/VM/
@@ -398,6 +402,9 @@ src/
                         would break value mapping on Postgres), and the
                         CONNECTION-scoped op serializer the nine transaction
                         sites share.
+    sqlite-write-lock.ts  The in-process single-writer lock every SQLite write
+                        (plain or transactional) takes; inside a transaction
+                        callback, write through `tx`, never the root client.
     dialect.ts          The portability seam — everything that genuinely
                         differs between sqlite and Postgres: rows() / changes()
                         / isUniqueViolation() / likeEscape() / dayBucket() /
@@ -936,6 +943,11 @@ data/
                             keyed by pi-ai sessionId).
       -home-agent-workspace/  Sandbox sessions (cwd inside the container).
   sandboxes/                Cloned repos per task (one dir per taskId).
+  unit-survey-cache/        `survey-units` reply cache (only with
+                            `review.analysis.enabled`):
+                            <owner>/<repo>/, keyed on endpoint, thinking level,
+                            system text and request. Pure cache — safe to
+                            delete; a re-review then re-asks every unit.
   build-assets/             Server-mode build handoff docs (only when
                             buildAssets.location=server):
                             <owner>/<repo>/<issueKey>/*.md — never committed

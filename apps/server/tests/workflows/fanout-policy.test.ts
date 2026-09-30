@@ -3,11 +3,11 @@ import { getWorkflow } from "#src/workflows/loader.js";
 import { AgentWorkflowSchema } from "lastlight-workflow-engine";
 
 /**
- * The soft-failure policy of the `survey` fan-out, read off the SHIPPED YAML as
- * an EFFECTIVE value.
+ * The soft-failure policy of the `site-review` fan-out, read off the SHIPPED
+ * YAML as an EFFECTIVE value.
  *
  * This test exists because of a specific, measured, silent failure. All six
- * survey phases declared `on_soft_failure: { retries: 1, then: complete }` at
+ * (since removed) agent survey phases declared `on_soft_failure: { retries: 1, then: complete }` at
  * PHASE level, where it belongs to `generic_loop` and zod therefore STRIPS it.
  * The policy silently reverted to `{ retries: 0, then: fail }`, so one degenerate
  * turn hard-failed the whole review — which records no
@@ -23,15 +23,12 @@ import { AgentWorkflowSchema } from "lastlight-workflow-engine";
  */
 
 const def = getWorkflow("pr-review");
-const survey = def.phases.find((p) => p.name === "survey");
+const survey = def.phases.find((p) => p.name === "site-review");
 
-describe("the survey fan-out's soft-failure policy survives parsing", () => {
-  it("is a fanout phase with five branches", () => {
-    // Five, not six: the `tests` branch was removed from the fan-out — the
-    // family has no seeder and no coverage source, so its branch only ever
-    // paid a sixth of the survey spend to write NOT MEASURED.
+describe("the site-review fan-out's soft-failure policy survives parsing", () => {
+  it("is a fanout phase with sixteen branches — one per site slot, pair slots included", () => {
     expect(survey?.type).toBe("fanout");
-    expect(survey?.branches).toHaveLength(5);
+    expect(survey?.branches).toHaveLength(16);
   });
 
   it("carries `{ retries: 1, then: complete }` AFTER the schema has had it", () => {
@@ -55,7 +52,15 @@ describe("the survey fan-out's soft-failure policy survives parsing", () => {
     // `{ from, default }` rather than a literal, so an operator dials it without
     // forking the workflow — and `default` is what a deployment whose context
     // lacks the key falls back to, loudly.
-    expect(survey?.max_concurrent).toEqual({ from: "surveyConcurrency", default: 6 });
+    expect(survey?.max_concurrent).toEqual({ from: "siteConcurrency", default: 6 });
+  });
+
+  it("starts no session for a slot `site-plan` already closed, and runs the pair slots on their own model", () => {
+    expect(survey?.skip_satisfied_branches).toBe(true);
+    const branches = survey?.branches ?? [];
+    expect(branches).toHaveLength(16);
+    expect(branches.slice(0, 8).every((b) => b.model === undefined)).toBe(true);
+    expect(branches.slice(8).every((b) => b.model === "{{models.review-site-pair}}")).toBe(true);
   });
 
   /**

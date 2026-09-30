@@ -89,8 +89,9 @@ export interface RepairAction {
   /** `recorded` — uncovered → internal. `promoted` — unbacked drop → internal.
    * `withdrawn` — unbacked drop whose hypothesis a finding already carries, so
    * the drop is removed and nothing is appended. `expanded` — an `internal[]`
-   * id-list entry materialized as a full internal row. */
-  kind: "recorded" | "promoted" | "withdrawn" | "expanded";
+   * id-list entry materialized as a full internal row. `filed` — a row
+   * `admit` kept away from the adjudicator, filed at internal with its rule. */
+  kind: "recorded" | "promoted" | "withdrawn" | "expanded" | "filed";
   hypothesis: string;
   detail: string;
 }
@@ -143,15 +144,6 @@ export interface CheckFindingsOptions {
 
 /** How many offending ids the summary names before it starts counting. */
 const MAX_LISTED = 20;
-
-/**
- * Line width for the ledger's outstanding list. Wrapping, never truncation.
- *
- * By WIDTH rather than a fixed id count, because ids are `<family>-NNN` and a
- * family name is as long as it is — `enforcement-001` is three times `H-001`,
- * and twelve per line silently ran to 157 characters.
- */
-const IDS_LINE_WIDTH = 100;
 
 function asString(value: unknown): string | null {
   return typeof value === "string" && value.length > 0 ? value : null;
@@ -507,15 +499,75 @@ export function checkFindings(options: CheckFindingsOptions): CheckFindingsResul
     notes: r.notes,
   });
 
-  // No `--repair`, or nothing to repair, or nothing readable to repair. The
-  // floor deliberately does NOT invent a `findings.json`: a fabricated
-  // `summary` and `event` is a review nobody wrote, and a phase whose loop
-  // simply runs out of iterations does not fail the run anyway. A SATISFIED
+  // A MISSING `findings.json` over a non-empty hypothesis set: the floor
+  // WRITES one. It used to refuse ("a fabricated summary is a review nobody
+  // wrote"), and that was right while `review` always ran — but with the
+  // evidence pipeline on, `review` is skipped and `site-finalize` is the ONLY
+  // writer. A finalize that fails, times out or never writes the file would
+  // leave post-review with nothing to read: the phase fails, the run
+  // goes red with nothing posted, per-head dedup records nothing, and the
+  // thirty-minute sweep re-buys the whole pipeline on the same SHA forever.
+  // What is written is not a review anyone wrote, and it says so: every
+  // hypothesis at `internal` (recorded, never posted — the same row the floor
+  // writes for an uncovered one), `event: COMMENT`, a summary stating that
+  // the review did not complete, and an `incomplete` marker a reader can
+  // key on. Safe in every workflow shape: when `review` RAN, a missing file
+  // means review failed, and post-review (`none_failed` on `review`) does not
+  // run at all. No hypotheses ⇒ nothing to conserve and nothing is invented.
+  const findingsPath = join(options.dir, "findings.json");
+  if (options.repair && first.document === null && !existsSync(findingsPath) && first.hypotheses.length > 0) {
+    const count = first.hypotheses.length;
+    const created: Record<string, unknown> = {
+      summary:
+        `The review did not complete, so the ${count} candidate issue${count === 1 ? "" : "s"} this review's analysis ` +
+        "recorded were not weighed and nothing is posted inline. They are kept, unposted, for the record. " +
+        "This is not a clean review: the change was not assessed.",
+      event: "COMMENT",
+      incomplete: {
+        phase: "site-finalize",
+        reason: "findings.json did not exist when the conservation floor ran — site-finalize failed, timed out, or never wrote it",
+      },
+      findings: first.hypotheses.map((id) =>
+        internalFinding(
+          id,
+          first.rows.get(id),
+          "Never weighed — findings.json was never written. Conserved at internal tier by the §D12 floor.",
+        ),
+      ),
+    };
+    FindingsDocumentSchema.parse(created);
+    writeFileSync(findingsPath, `${JSON.stringify(created, null, 2)}\n`, "utf8");
+    log.warn("findings.json was missing; the conservation floor wrote an unadjudicated one", {
+      dir: options.dir,
+      hypotheses: count,
+    });
+    const second = inspect({ ...options, repair: false });
+    return {
+      ...strip(second),
+      repaired: first.hypotheses.map((id) => ({
+        kind: "recorded" as const,
+        hypothesis: id,
+        detail: 'findings.json was missing — written with every hypothesis at tier "internal"',
+      })),
+      notes: [...second.notes, `findings.json was MISSING: written unadjudicated, ${count} hypothes${count === 1 ? "is" : "es"} at internal tier, event COMMENT`],
+      satisfied: true,
+    };
+  }
+
+  // No `--repair`, or nothing to repair, or nothing readable to repair. An
+  // UNREADABLE document is left alone — it is somebody's review, and
+  // overwriting it would destroy what was written; a missing one with no
+  // hypotheses is not invented (there is nothing to conserve, and post-review
+  // then fails loudly on the missing file, as it always has). A SATISFIED
   // document still gets the repair pass when it carries the `internal[]`
   // shorthand: expansion is the reader-compat half of that contract —
   // post-review's disposition record, the pipeline stats and the
   // internal-recall judge all read full rows.
-  if (!options.repair || first.document === null || (first.satisfied && first.internalShorthand.length === 0)) {
+  if (
+    !options.repair ||
+    first.document === null ||
+    (first.satisfied && first.internalShorthand.length === 0)
+  ) {
     return strip(first);
   }
 
@@ -641,184 +693,6 @@ export function checkFindings(options: CheckFindingsOptions): CheckFindingsResul
   // repair — a duplicate, a fabricated id — is REPORTED and the gate closes.
   const second = inspect({ ...options, repair: false });
   return { ...strip(second), repaired, satisfied: true };
-}
-
-/**
- * One hypothesis, as the adjudicator needs to see it while it works.
- *
- * Deliberately the fields that let a claim be DISPOSED of — where it is, how
- * severe it was thought to be, which obligation produced it — and not the
- * evidence, quotes or transcripts. Those stay in the `.jsonl`, because the
- * adjudicator has to read the record to judge it and a ledger that inlined
- * everything would be the six files again with extra steps.
- */
-export interface LedgerEntry {
-  id: string;
-  /** The FILENAME's family — present for every hypothesis, never self-reported. */
-  family: string;
-  obligation: string | null;
-  path: string | null;
-  severity: string | null;
-  confidence: number | null;
-  /** The claim's first sentence, bounded — a label to recognise it by. */
-  title: string;
-  /** Does it already carry exactly one disposition in `findings.json`? */
-  accounted: boolean;
-}
-
-export interface FindingsLedger {
-  /** Every declared id, grouped-by-family order preserved in `families`. */
-  entries: LedgerEntry[];
-  /** The subset with no disposition yet — the todo list. */
-  uncovered: LedgerEntry[];
-  /** The other three ways the gate fails, so the ledger is not a partial view. */
-  duplicates: FindingsGap[];
-  fabricated: FindingsGap[];
-  unbackedDrops: FindingsGap[];
-  families: string[];
-  documentError: string | null;
-  /** True ⇒ writing nothing further would pass the gate. */
-  satisfied: boolean;
-}
-
-/**
- * The CHECKLIST half of conservation — same reading, opposite audience.
- *
- * `checkFindings` answers the harness's question ("may the loop stop?") with an
- * exit code. This answers the adjudicator's ("what must I account for, and what
- * have I not?") with a list, and it is what makes the gate satisfiable on the
- * FIRST attempt: measured, attempt 1 spent 426 s and $0.52 reconstructing the id
- * set by reading six `.jsonl` files, missed some, and bought a second 274 s /
- * $0.43 attempt — 40% of the case's wall clock and 38% of its cost, for a set
- * that is mechanically derivable.
- *
- * It reads through the same `inspect` the gate does, so the checklist and the
- * verdict can never disagree about which ids exist. That is the whole reason it
- * lives here rather than in the prompt as an instruction to go and count.
- */
-export function buildFindingsLedger(options: CheckFindingsOptions): FindingsLedger {
-  const result = inspect({ ...options, repair: false });
-  const covered = new Set(result.covered);
-  // An unreadable `findings.json` makes `inspect` return early with NO gaps —
-  // correct for the gate, which fails on the document error alone and wants the
-  // next iteration to write one. For a checklist it would be a lie of omission:
-  // nothing has a disposition when there is no document to hold one, so every
-  // declared id is outstanding.
-  const uncoveredIds =
-    result.documentError !== null
-      ? new Set(result.rows.keys())
-      : new Set(result.gaps.filter((g) => g.kind === "uncovered").map((g) => g.hypothesis));
-
-  const families: string[] = [];
-  const entries: LedgerEntry[] = [];
-  for (const [id, record] of result.rows) {
-    const { row, family } = record;
-    if (!families.includes(family)) families.push(family);
-    const claim = asString(row.claim);
-    entries.push({
-      id,
-      family,
-      obligation: asString(row.obligation),
-      path: pathOf(row),
-      severity: severityOf(row),
-      confidence: typeof row.confidence === "number" ? row.confidence : null,
-      title: claim ? titleFrom(claim) : `(no claim recorded on ${id})`,
-      accounted: covered.has(id),
-    });
-  }
-  // Declaration order — `<family>-NNN` sorts that way already, and the files are
-  // read sorted, so the checklist reads in the order the surveys wrote it.
-  entries.sort((a, b) => a.family.localeCompare(b.family) || a.id.localeCompare(b.id));
-
-  return {
-    entries,
-    uncovered: entries.filter((e) => uncoveredIds.has(e.id)),
-    duplicates: result.gaps.filter((g) => g.kind === "duplicate"),
-    fabricated: result.gaps.filter((g) => g.kind === "fabricated"),
-    unbackedDrops: result.gaps.filter((g) => g.kind === "unbacked-drop"),
-    families: families.sort(),
-    documentError: result.documentError,
-    satisfied: result.satisfied,
-  };
-}
-
-/**
- * Render the ledger for an agent's context.
- *
- * **Nothing here is capped, and that is deliberate** — `renderFindingsCheck`
- * stops naming ids at 20 because it is a log line, but a checklist that elided
- * entries would reproduce the exact omission it exists to prevent. The bound is
- * on each claim (one sentence, ~100 chars via `titleFrom`), never on the count.
- */
-export function renderFindingsLedger(ledger: FindingsLedger): string {
-  const lines: string[] = [];
-  const total = ledger.entries.length;
-
-  if (total === 0) {
-    return [
-      "conservation ledger: no hypotheses were declared.",
-      "  The surveys wrote no hypotheses/*.jsonl, so there is nothing to account for",
-      "  and the gate will pass on that basis. This is NOT evidence that the review",
-      "  is complete — write your findings from the diff as usual.",
-    ].join("\n");
-  }
-
-  const done = ledger.entries.filter((e) => e.accounted).length;
-  lines.push(
-    `conservation ledger: ${done}/${total} hypotheses accounted for, across ${ledger.families.length} famil${ledger.families.length === 1 ? "y" : "ies"}.`,
-    "Every id below must appear EXACTLY ONCE in findings.json — in some finding's",
-    '`hypotheses` array (any tier; `internal` is a valid answer) or in `dropped`',
-    "with a `refutedBy` transcript that exists on disk.",
-    "",
-  );
-
-  if (ledger.documentError !== null) {
-    lines.push(
-      "findings.json is not readable yet, so every id below is outstanding:",
-      `  ${ledger.documentError}`,
-      "",
-    );
-  }
-
-  let family: string | undefined;
-  for (const e of ledger.entries) {
-    if (e.family !== family) {
-      family = e.family;
-      lines.push(`── ${family} ──`);
-    }
-    const mark = e.accounted ? "[x]" : "[ ]";
-    const meta = [e.obligation, e.severity, e.path].filter(Boolean).join(" · ");
-    lines.push(`  ${mark} ${e.id}${meta ? `  (${meta})` : ""}`);
-    lines.push(`        ${e.title}`);
-  }
-
-  if (ledger.uncovered.length > 0) {
-    lines.push(
-      "",
-      `OUTSTANDING — ${ledger.uncovered.length} of ${total} still have no disposition:`,
-    );
-    // Wrapped rather than one long line: this is the list the next attempt
-    // works from, and every id has to stay legible however many there are.
-    let row: string[] = [];
-    let width = 0;
-    for (const id of ledger.uncovered.map((e) => e.id)) {
-      if (row.length > 0 && width + 1 + id.length > IDS_LINE_WIDTH) {
-        lines.push(`  ${row.join(" ")}`);
-        row = [];
-        width = 0;
-      }
-      width += (row.length > 0 ? 1 : 0) + id.length;
-      row.push(id);
-    }
-    if (row.length > 0) lines.push(`  ${row.join(" ")}`);
-  }
-  for (const gap of [...ledger.duplicates, ...ledger.unbackedDrops, ...ledger.fabricated]) {
-    lines.push(`  ✗ ${gap.hypothesis} [${gap.kind}]: ${gap.detail}`);
-  }
-  if (ledger.satisfied) {
-    lines.push("", "Conservation holds. Every id has exactly one disposition.");
-  }
-  return lines.join("\n");
 }
 
 /** A one-screen summary for the phase log — the gate's whole stdout. */

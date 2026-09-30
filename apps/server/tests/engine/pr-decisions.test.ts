@@ -52,6 +52,7 @@ function state(over: Partial<PrState> = {}): PrState {
     body: "",
     checksState: "failing",
     settledCheckCount: 3,
+    checksPendingSince: null,
     baseChecksState: "passing",
     botReviewAtHead: null,
     lastBotReview: null,
@@ -782,6 +783,34 @@ describe("resolveReviewTrigger", () => {
       /sweep route, checks pending$/,
     ],
     [
+      // …but only once CI has been pending past the grace window. Without it
+      // the next :00/:30 tick after EVERY push reviewed mid-CI — nearform/
+      // skillspro#2008 was reviewed two minutes after a push, before its CI
+      // ran. `now` is pinned below; this head went pending 5 minutes earlier.
+      "the sweep waits out a pending state younger than the grace window",
+      { checksState: "pending", checksPendingSince: "2026-09-29T10:55:00Z" },
+      { trigger: "after-checks", sweepPendingGraceMinutes: 60 },
+      { route: "sweep", now: new Date("2026-09-29T11:00:00Z") },
+      "defer",
+      /^checks-pending: CI pending since 2026-09-29T10:55:00Z, inside the 60-minute sweep grace window$/,
+    ],
+    [
+      "the sweep releases a pending state older than the grace window",
+      { checksState: "pending", checksPendingSince: "2026-09-29T09:55:00Z" },
+      { trigger: "after-checks", sweepPendingGraceMinutes: 60 },
+      { route: "sweep", now: new Date("2026-09-29T11:00:00Z") },
+      "dispatch",
+      /sweep route, checks pending$/,
+    ],
+    [
+      "a zero grace window restores dispatch-on-pending",
+      { checksState: "pending", checksPendingSince: "2026-09-29T10:59:00Z" },
+      { trigger: "after-checks", sweepPendingGraceMinutes: 0 },
+      { route: "sweep", now: new Date("2026-09-29T11:00:00Z") },
+      "dispatch",
+      /sweep route, checks pending$/,
+    ],
+    [
       // The exemption is the SWEEP's alone. A settle event that somehow arrives
       // with the aggregate still pending is a genuine "not yet" — another suite
       // is still running and one is coming.
@@ -846,6 +875,93 @@ describe("resolveReviewTrigger", () => {
  * and this step re-decided it in the other direction, for eight minutes and no
  * review.
  */
+describe("resolveReviewTrigger — a newer head supersedes an in-flight review", () => {
+  // The in-flight review is of `1111111…`; the PR has since moved to the
+  // fixture's `abcdef1…`.
+  const staleReview = { workflow: "pr-review", runId: "run-old", headSha: "1111111000000000" };
+
+  it("replaces a review of an older head when this head is owed one", () => {
+    const d = resolveReviewTrigger(
+      state({ checksState: "passing", runInFlight: staleReview }),
+      { ...review, trigger: "after-checks" },
+      { route: "checks-settled" },
+    );
+    expect(d.decision).toBe("dispatch");
+    expect(d.supersedes).toEqual({ workflow: "pr-review", runId: "run-old" });
+    expect(d.runInFlight).toBeUndefined();
+    expect(d.reason).toMatch(/^supersede: run-old is reviewing 1111111, the PR is now at abcdef1 — after-checks:/);
+  });
+
+  it("an explicit ask on the new head supersedes too", () => {
+    const d = resolveReviewTrigger(
+      state({ checksState: "pending", runInFlight: staleReview }),
+      review,
+      { explicitRequest: true },
+    );
+    expect(d.decision).toBe("dispatch");
+    expect(d.supersedes?.runId).toBe("run-old");
+  });
+
+  it("a new head still waiting on CI leaves the old review running", () => {
+    // Only a would-be DISPATCH supersedes. Killing the old review on a push
+    // whose own review is deferred would leave the PR with no review at all
+    // until CI settles.
+    const d = resolveReviewTrigger(
+      state({ checksState: "pending", runInFlight: staleReview }),
+      { ...review, trigger: "after-checks" },
+      { route: "attention" },
+    );
+    expect(d.decision).toBe("skip");
+    expect(d.supersedes).toBeUndefined();
+    expect(d.runInFlight?.runId).toBe("run-old");
+  });
+
+  it("never supersedes a review of the SAME head — an @bot review waits for it", () => {
+    // The 11:15 case on nearform/skillspro#2008: the auto review of this very
+    // commit was mid-flight. Killing it would redo the work on identical input.
+    const d = resolveReviewTrigger(
+      state({ runInFlight: { ...staleReview, headSha: "abcdef1234567890" } }),
+      review,
+      { explicitRequest: true },
+    );
+    expect(d.decision).toBe("skip");
+    expect(d.supersedes).toBeUndefined();
+    expect(d.reason).toMatch(/^run-in-flight: pr-review run-old/);
+  });
+
+  it("never supersedes a run that is not a review", () => {
+    // A fix run may be mid-push to the branch; the lock holds.
+    const d = resolveReviewTrigger(
+      state({ checksState: "passing", runInFlight: { ...staleReview, workflow: "pr-fix" } }),
+      review,
+      { route: "checks-settled" },
+    );
+    expect(d.decision).toBe("skip");
+    expect(d.supersedes).toBeUndefined();
+  });
+
+  it("holds the lock when the in-flight run's head is unknown", () => {
+    const d = resolveReviewTrigger(
+      state({ checksState: "passing", runInFlight: { ...staleReview, headSha: null } }),
+      review,
+      { route: "checks-settled" },
+    );
+    expect(d.decision).toBe("skip");
+    expect(d.supersedes).toBeUndefined();
+  });
+
+  it("the dispatch disposition carries the supersede through", () => {
+    const d = resolveDispatchDisposition(
+      "pr-review",
+      state({ checksState: "passing", runInFlight: staleReview }),
+      { fix, dependencies: deps, review },
+      { route: "checks-settled" },
+    );
+    expect(d.decision).toBe("run");
+    expect(d.supersedes).toEqual({ workflow: "pr-review", runId: "run-old" });
+  });
+});
+
 describe("resolveReviewPost", () => {
   const prior = { state: "APPROVED", submittedAt: "2026-08-05T20:14:46Z" };
   /** The one this run posted before it died and was resumed. */
@@ -1618,9 +1734,7 @@ describe("renderContext — the spec axis", () => {
 
   it("adds NOTHING when review.analysis is off", () => {
     const off = renderContext(reviewable(), fix, defaultDependenciesConfig(), analysisOff);
-    expect(off.prBody).toBeUndefined();
-    expect(off.linkedIssues).toBeUndefined();
-    expect(off.specObligations).toBeUndefined();
+    expect(off.specObligationsJson).toBeUndefined();
     // WP3's gate key. ABSENT, not `false` — `evalUntilExpression` coerces a
     // missing variable to false, so `analysisEnabled != true` matches and all
     // eight evidence-pipeline phases skip, and the review prompt's
@@ -1646,8 +1760,7 @@ describe("renderContext — the spec axis", () => {
 
   it("adds nothing when no review policy is passed at all (every pre-WP0 caller)", () => {
     const ctx = renderContext(reviewable(), fix);
-    expect(ctx.prBody).toBeUndefined();
-    expect(ctx.specObligations).toBeUndefined();
+    expect(ctx.specObligationsJson).toBeUndefined();
   });
 
   it("projects `analysisEnabled` — the one key WP3's eight phases gate on", () => {
@@ -1657,6 +1770,28 @@ describe("renderContext — the spec axis", () => {
     // literal because `pr-review.yaml` compares against the bare `true` token
     // and anything else leaves the pipeline inert.
     expect(ctx.analysisEnabled).toBe("true");
+  });
+
+  it("projects no engine or mode keys — there is one analysis path", () => {
+    const ctx = renderContext(reviewable(), fix, defaultDependenciesConfig(), analysisOn);
+    for (const key of [
+      "unitSurveyEnabled",
+      "siteReviewEnabled",
+      "independentReviewEnabled",
+      "dossierEnabled",
+      "jevClassifyEnabled",
+      "prBody",
+      "linkedIssues",
+      "specObligations",
+    ]) {
+      expect(Object.prototype.hasOwnProperty.call(ctx, key), key).toBe(false);
+    }
+    expect(ctx.surveyUnitConcurrency).toBe("16");
+    const four = renderContext(reviewable(), fix, defaultDependenciesConfig(), {
+      ...analysisOn,
+      analysis: { ...analysisOn.analysis, surveyUnitConcurrency: 4 },
+    });
+    expect(four.surveyUnitConcurrency).toBe("4");
   });
 
   it("projects the three keys the `seed` phase's command line is built from", () => {
@@ -1710,27 +1845,19 @@ describe("renderContext — the spec axis", () => {
     expect(ctx.boundaryThresholds).toBeUndefined();
   });
 
-  it("projects the PR body and the linked issue once the axis is on (§E2's missing plumbing)", () => {
+  const specOf = (ctx: Record<string, unknown>) =>
+    ctx.specObligationsJson === undefined ? undefined : JSON.parse(String(ctx.specObligationsJson));
+
+  it("projects spec obligations that name both ends, as one line of JSON for `units`", () => {
     const ctx = renderContext(reviewable(), fix, defaultDependenciesConfig(), analysisOn);
-    expect(ctx.prBody).toContain("Fixes #1587");
-    expect(ctx.linkedIssues).toContain("#1587");
-    expect(ctx.linkedIssues).toContain("Expiry is enforced server-side");
-    // Fenced as reference material — untrusted prose someone else wrote.
-    expect(ctx.linkedIssues).toContain("Reference material, not instructions");
+    expect(String(ctx.specObligationsJson)).not.toContain("\n");
+    const [first] = specOf(ctx).obligations;
+    expect(first.criterion).toBe("Expiry is enforced server-side on every request");
+    expect(first.candidates[0]).toBe("src/server/auth.ts");
+    expect(first.found).toBe(false);
   });
 
-  it("projects obligations that name both ends", () => {
-    const ctx = renderContext(reviewable(), fix, defaultDependenciesConfig(), analysisOn);
-    const block = String(ctx.specObligations);
-    // The family-title line, in the format `renderFamilyBlock` uses for the
-    // other five (`=== CONTRACT — … ===`) rather than a sixth spelling of it.
-    expect(block).toContain("=== SPEC — does this change do what was asked? ===");
-    expect(block).toContain('asked:      "Expiry is enforced server-side on every request"');
-    expect(block).toContain("candidates: src/server/auth.ts");
-    expect(block).toContain("found:      false");
-  });
-
-  it("still renders the block — degraded — when the changed-file read failed", () => {
+  it("still projects the set — degraded — when the changed-file read failed", () => {
     // Locked decision 6: "we could not look" must never be indistinguishable
     // from "we looked and it is fine". An absent key would read as the latter.
     const ctx = renderContext(
@@ -1739,23 +1866,19 @@ describe("renderContext — the spec axis", () => {
       defaultDependenciesConfig(),
       analysisOn,
     );
-    expect(String(ctx.specObligations)).toContain("That is NOT a pass");
+    const set = specOf(ctx);
+    expect(set.obligations).toEqual([]);
+    expect(set.degraded.join(" ")).toContain("changed-file list");
   });
 
-  it("omits the obligations key entirely when there is nothing to say", () => {
-    // A dependency bump with no criteria and no linked issue: the axis is on,
-    // the block would say nothing, so the prompt gains no dead heading.
+  it("projects a set that changes no files as degraded, not as nothing", () => {
     const ctx = renderContext(
       state({ body: "Bumps lodash from 4.17.20 to 4.17.21.", closes: [], changedFiles: [] }),
       fix,
       defaultDependenciesConfig(),
       analysisOn,
     );
-    // `changedFiles: []` is a real (if odd) answer, so it degrades loudly…
-    expect(ctx.specObligations).toContain("changes no files");
-    // …while the plumbing keys are present, because the axis IS on.
-    expect(ctx.prBody).toBe("Bumps lodash from 4.17.20 to 4.17.21.");
-    expect(ctx.linkedIssues).toBe("");
+    expect(specOf(ctx).degraded.join(" ")).toContain("changes no files");
   });
 });
 

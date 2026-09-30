@@ -120,6 +120,15 @@ export interface FakeExecutionRow {
   cpuSeconds?: number;
   peakMemoryBytes?: number;
   memoryLimitBytes?: number;
+  /**
+   * The session the row links to, and what it cost. Recorded so a test can
+   * pin the two things the dashboard and stats read off this table and
+   * nowhere else: which transcript a phase owns, and what it spent.
+   */
+  sessionId?: string;
+  costUsd?: number;
+  inputTokens?: number;
+  outputTokens?: number;
 }
 
 type LedgerRow = FakeExecutionRow;
@@ -194,8 +203,10 @@ export class InMemoryStateStore implements WorkflowStateStore {
     },
     finishRun: async (id, status, opts) => {
       const row = this.ensureRun(id);
-      // Mirrors the real store: a paused run is never flipped to `succeeded`.
+      // Mirrors the real store: a paused run is never flipped to `succeeded`,
+      // and a cancelled run is never flipped at all.
       if (status === "succeeded" && row.status === "paused") return;
+      if (row.status === "cancelled" && status !== "cancelled") return;
       if (opts?.terminalMarker) row.history.push({ ...opts.terminalMarker, timestamp: new Date().toISOString(), success: true } as PhaseHistoryEntry);
       row.status = status;
     },
@@ -263,9 +274,16 @@ export class InMemoryStateStore implements WorkflowStateStore {
         row.cpuSeconds = result.cpuSeconds;
         row.peakMemoryBytes = result.peakMemoryBytes;
         row.memoryLimitBytes = result.memoryLimitBytes;
+        if (result.sessionId !== undefined) row.sessionId = result.sessionId;
+        row.costUsd = result.costUsd;
+        row.inputTokens = result.inputTokens;
+        row.outputTokens = result.outputTokens;
       }
     },
-    recordSessionId: async () => {},
+    recordSessionId: async (id, sessionId) => {
+      const row = this.byExecId.get(id);
+      if (row) row.sessionId = sessionId;
+    },
     recordOutputText: async (id, text) => {
       const row = this.byExecId.get(id);
       if (row) row.output = text;

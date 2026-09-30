@@ -114,3 +114,37 @@ export {
   OVERLAY_README,
 } from "lastlight-shared/overlay-bootstrap";
 export type { GhStatus, ScaffoldResult, BootstrapOpts } from "lastlight-shared/overlay-bootstrap";
+
+// ── the unit survey's model half (docs/plans/pr-review-units-sites.md → "Evals") ───────
+//
+// The `survey-units` phase is one bounded call per unit, and its handler only
+// wraps a runner with a ledger row and a transcript. The runner is exported so
+// the evals replay (`apps/evals/scripts/unit-survey-replay.ts`) measures the
+// SAME calls, retry rule and response records the phase makes — never a copy —
+// with the cache off, so every replay pays and measures. `buildSpecObligations`
+// rides along because `spec-obligations.json` is built harness-side from the
+// PR body and the issues it closes; a replay that skipped it would cut units
+// with no spec axis at all.
+export { runUnitSurvey, readUnitsDocument, completeUnitCall } from "./workflows/handlers/survey-units.js";
+export type {
+  RunUnitSurveyOptions,
+  UnitSurveyRun,
+  UnitOutcome,
+  UnitResponseRecord,
+  UnitCallUsage,
+  UnitModelCall,
+  UnitsDocument as SurveyUnitsDocument,
+} from "./workflows/handlers/survey-units.js";
+export { buildSpecObligations } from "./engine/review-spec.js";
+// The site investigator's `{{prIntent}}` block — the replay's `--pr-context`
+// renders it from the case's PR with the same function the pipeline uses.
+export { renderPrIntent } from "./engine/pr-intent.js";
+export type { SpecObligationSet, SpecInputs } from "./engine/review-spec.js";
+
+// The event shim — the stream-json session jsonl every agent phase writes, and
+// the one the evals dashboard follows live. Exported so a phase replay that
+// drives agentic-pi directly (`apps/evals/scripts/micro-{falsify,adjudicate}.ts`)
+// records its sessions in exactly the envelope a real run does, and the live
+// viewer follows them unchanged — never a second converter.
+export { AgenticShim } from "./engine/event-shim.js";
+export type { AgenticShimOptions } from "./engine/event-shim.js";

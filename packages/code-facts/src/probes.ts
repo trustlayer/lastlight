@@ -113,6 +113,7 @@ import { basename, join, resolve } from "node:path";
 
 import { type HypothesisSet, readHypothesisSet, resolveHypothesis } from "./hypotheses.js";
 import { parseJsonl } from "./jsonl.js";
+import { readProbePlan } from "./probe-plan.js";
 import { isBehaviouralClaim, severityOf } from "./survey-verdict.js";
 
 /**
@@ -226,7 +227,7 @@ export function isReadOnlyCommand(command: string): boolean {
 }
 
 /** A hypothesis line, as far as this gate cares. Everything else is ignored. */
-interface HypothesisLine {
+export interface HypothesisLine {
   id?: unknown;
   needsProbe?: unknown;
   severity?: unknown;
@@ -253,7 +254,10 @@ export interface ProbeGapKind {
 }
 
 export interface CheckProbesResult {
-  /** Hypotheses that had to be probed: `needsProbe`, or `Critical` regardless. */
+  /**
+   * Hypotheses that had to be probed: `probe-plan`'s selected list when it ran,
+   * else `needsProbe` or `Critical` over every row.
+   */
   required: string[];
   /** Of those, the ones with a verdict of any kind. */
   answered: string[];
@@ -438,9 +442,8 @@ function borrowedFromOf(set: HypothesisSet, ownId: string, transcript: string | 
  * Every hypothesis that has an answer, canonical id resolved, newest line
  * winning — the one reader of `probes/verdicts.jsonl`.
  *
- * Split out of {@link checkProbes} so the adjudication dossier
- * (`adjudicate-render.ts`) can inline a verdict and its transcript without a
- * second parser. Two readers of one append-only artifact is two places for
+ * Split out of {@link checkProbes} so every other reader (the severity
+ * derivation among them) can read a verdict without a second parser. Two readers of one append-only artifact is two places for
  * "which line wins" and "which id does this answer" to disagree, and both
  * questions have already cost this pipeline a measurement.
  *
@@ -550,9 +553,23 @@ export function checkProbes(options: CheckProbesOptions): CheckProbesResult {
   const set = readHypothesisSet(options.dir);
   malformed += set.malformed;
   const families = set.families;
+  // The owed set is `probe-plan`'s when it ran — the ranked, capped list the
+  // prompt showed the agent, so the gate cannot owe a row the agent was never
+  // shown — and `requiresProbe` over every row when it did not (an older
+  // workflow, a replayed workspace), which is what the plan is computed from.
+  const plan = readProbePlan(options.dir);
   const required = new Set<string>();
-  for (const record of set.records) {
-    if (requiresProbe(record.row as HypothesisLine)) required.add(record.id);
+  if (plan) {
+    for (const p of plan.selected) if (set.byId.has(p.id)) required.add(p.id);
+    if (plan.deferred.length > 0) {
+      notes.push(
+        `${plan.deferred.length} owed hypothesis(es) are past the probe cap of ${plan.maxProbes} — not required here; they reach adjudication unprobed`,
+      );
+    }
+  } else {
+    for (const record of set.records) {
+      if (requiresProbe(record.row as HypothesisLine)) required.add(record.id);
+    }
   }
 
   const { answers, malformed: badVerdicts } = readProbeAnswers(options, set);

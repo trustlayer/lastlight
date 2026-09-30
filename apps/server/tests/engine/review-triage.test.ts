@@ -19,15 +19,16 @@ import {
   harvestReviewTriage,
   parseTriageMarker,
   readReviewTriage,
+  reviewTriageSeed,
 } from "#src/engine/review-triage.js";
 
 const RUN = "run-1";
 
 /** The namespace `runner.ts` seeds before the first phase of a review run. */
-const SEED_DEEP = { depth: "full", deep: true, baseline: false };
+const SEED_FULL = { depth: "full", baseline: true, skipReview: true };
 
 /** A run row whose scratch a harvest can merge into, plus the merge itself. */
-function harness(seed: Record<string, unknown> | undefined = SEED_DEEP) {
+function harness(seed: Record<string, unknown> | undefined = SEED_FULL) {
   const row = {
     id: RUN,
     scratch: seed ? { [REVIEW_TRIAGE_SCRATCH_KEY]: seed } : {},
@@ -83,24 +84,31 @@ describe("parseTriageMarker", () => {
 });
 
 describe("harvestReviewTriage", () => {
-  it("replaces the namespace on `light`, clearing the other two prompt arms", async () => {
-    // Exactly one of baseline/deep/light must be true, or the review prompt
-    // renders two briefs — or none.
+  it("replaces the namespace on `light`, clearing the other prompt arm", async () => {
+    // Exactly one of baseline/light must be true, or the review prompt renders
+    // two briefs — or none.
     const { row, db } = harness();
     await harvestReviewTriage(db, RUN, "triage", "REVIEW_DEPTH: light");
     expect(readReviewTriage(row)).toEqual({
       depth: "light",
       light: true,
-      deep: false,
       baseline: false,
+      skipReview: false,
     });
+  });
+
+  it("drops `skipReview` on `light`, so a light review runs the `review` phase", async () => {
+    const { row, db } = harness(reviewTriageSeed({ analysisEnabled: "true" }) as unknown as Record<string, unknown>);
+    expect(readReviewTriage(row)?.skipReview).toBe(true);
+    await harvestReviewTriage(db, RUN, "triage", "REVIEW_DEPTH: light");
+    expect(readReviewTriage(row)?.skipReview).toBe(false);
   });
 
   it("leaves the seed standing on `full`", async () => {
     const { row, db } = harness();
     await harvestReviewTriage(db, RUN, "triage", "REVIEW_DEPTH: full");
     expect(readReviewTriage(row)?.depth).toBe("full");
-    expect(readReviewTriage(row)?.deep).toBe(true);
+    expect(readReviewTriage(row)?.baseline).toBe(true);
   });
 
   it("leaves the seed standing when the phase emitted no marker", async () => {
@@ -161,5 +169,21 @@ describe("readReviewTriage", () => {
     expect(readReviewTriage({ scratch: { reviewTriage: "light" } })).toBeNull();
     expect(readReviewTriage({ scratch: { reviewTriage: ["light"] } })).toBeNull();
     expect(readReviewTriage({ scratch: { reviewTriage: { depth: "lightweight" } } })?.depth).toBe("full");
+  });
+});
+
+describe("reviewTriageSeed", () => {
+  it("pipeline off: the baseline arm, and never a review skip", () => {
+    for (const ctx of [{}, { analysisEnabled: "false" }]) {
+      expect(reviewTriageSeed(ctx), JSON.stringify(ctx)).toEqual({ depth: "full", baseline: true });
+    }
+  });
+
+  it("pipeline on: skip `review` — site-finalize writes findings.json", () => {
+    expect(reviewTriageSeed({ analysisEnabled: "true" })).toEqual({ depth: "full", baseline: true, skipReview: true });
+  });
+
+  it("reads the flag the way the phases' guards do — the string `true` or a boolean", () => {
+    expect(reviewTriageSeed({ analysisEnabled: true }).skipReview).toBe(true);
   });
 });

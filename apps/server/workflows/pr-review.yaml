@@ -64,12 +64,19 @@ phases:
   # it is INERT unless `review.analysis.enabled` — each phase carries
   # `skip_if: analysisEnabled != true`, and an absent variable reads as false,
   # so a typo skips the analysis rather than running an unasked-for one.
-  # `prepare` and `falsify` need `review.analysis.probes` on top.
+  #
+  # The one analysis path: facts → seed → the unit survey → the `sites` review
+  # engine → reconcile. `prepare`, `probe-plan` and `falsify` are kept but NOT
+  # ATTACHED (`falsifyAttached != true` — no code projects the key): nothing in
+  # the sites engine reads their output yet, and wiring them back in is its own
+  # measured change (docs/plans/pr-review-units-sites.md, stage 5).
   #
   # Each also carries the TIER guard, `scratch.reviewTriage.depth == 'light'`.
   # Quoted `==` there, the mirror image of the bare-boolean form above: an
   # absent value never matches, so the phase RUNS — again failing toward a full
-  # review. `review` and `post-review` carry no tier guard and always run.
+  # review. `post-review` carries no tier guard and always runs; `review` runs
+  # unless the pipeline replaces it (see its own `skip_if`), and always runs on
+  # `light`.
   - name: prepare
     label: Prepare · probe environment
     type: bash
@@ -83,6 +90,7 @@ phases:
     skip_if:
       - "analysisEnabled != true"
       - "probesEnabled != true"
+      - "falsifyAttached != true"
       - "scratch.reviewTriage.depth == 'light'"
     timeout_seconds: { from: probePhaseTimeoutSeconds }
     command: |
@@ -154,17 +162,17 @@ phases:
       # The shell-level catch covers what `--never-fail` cannot: a process that
       # DIES (OOM, a segfault in the native parser). `--stage-diff` writes the
       # per-file patches here, where the merge base is already resolved, so no
-      # survey branch has to derive the range again.
+      # investigator has to derive the range again.
       if ! "$FACTS" all --repo . --base "$BASE" --head HEAD --out "$OUT" --stage-diff --never-fail; then
         fallback "the analysis process died without writing an envelope (OOM, a segfault in the native parser, or a compiler binary that cannot exec) — NOTHING here may be read as 'no findings'"
       fi
       echo "facts: $(wc -c < "$OUT" 2>/dev/null || echo 0) bytes, base $BASE"
-      # Logged separately so "nothing was staged" and "the branches never found
-      # it" are two lines rather than one silence.
+      # Logged separately so "nothing was staged" and "the investigators never
+      # found it" are two lines rather than one silence.
       if [ -s .lastlight/pr-review/diff/index.md ]; then
         echo "facts: staged $(ls .lastlight/pr-review/diff/*.patch 2>/dev/null | wc -l) per-file patch(es) under .lastlight/pr-review/diff/"
       else
-        echo "facts: NO staged diff — every survey branch will have to derive the range itself"
+        echo "facts: NO staged diff — every investigator will have to derive the range itself"
       fi
 
   - name: seed
@@ -189,122 +197,464 @@ phases:
       set -- seed --facts .lastlight/pr-review/facts.json \
         --out .lastlight/pr-review/obligations.json \
         --contract "${CONTRACT:-minimal}" \
-        --max-obligations "${MAX_OBLIGATIONS:-48}" \
-        --blocks .lastlight/pr-review/obligations
+        --max-obligations "${MAX_OBLIGATIONS:-48}"
       if [ -n "$MINT" ]; then set -- "$@" --mint "$MINT"; fi
       "$FACTS" "$@" || true
       echo "seed: contract ${CONTRACT:-minimal} backstop ${MAX_OBLIGATIONS:-48} mint ${MINT:-none}"
-      echo "seed: $(ls .lastlight/pr-review/obligations 2>/dev/null | wc -l) family block(s)"
-
-      # A block is always emitted for all five seedable families, even a NOT
-      # MEASURED one, so a MISSING line here is a seeder failure — and a survey
-      # that then reports the family clean is reporting on no measurement at
-      # all. `spec` is absent by design: it is built harness-side.
-      for FAMILY in contract enforcement security state tests; do
-        BLOCK=".lastlight/pr-review/obligations/$FAMILY.md"
-        if [ -s "$BLOCK" ]; then
-          echo "seed: $FAMILY block $(wc -c < "$BLOCK") bytes"
-        else
-          echo "seed: $FAMILY block MISSING — the survey branch for this family will run UNSEEDED"
-        fi
-      done
+      if [ -s .lastlight/pr-review/obligations.json ]; then
+        echo "seed: obligations.json $(wc -c < .lastlight/pr-review/obligations.json) bytes"
+      else
+        echo "seed: obligations.json MISSING — every unit will be cut with no obligation"
+      fi
       exit 0
 
-  # The six survey families, run CONCURRENTLY as one node: six agent sessions
-  # in one provisioned workspace, one `executions` row each, so per-family
-  # cost, resume and the dashboard column all survive. The families are
-  # pairwise disjoint — each appends to its own `hypotheses/<family>.jsonl` —
-  # so there is no ordering between them.
+  # ── The unit survey (docs/plans/pr-review-units-sites.md) ─────────────────────────────
   #
-  # Prompt order is fixed and expensive to change: the shared prefix (skills,
-  # AGENTS.md, diff summary) goes first and the family's obligations last, so
-  # the six share one provider-side cached prefix.
-  - name: survey
-    label: Survey · five families
-    type: fanout
-    skills: [survey-pass]
-    model: "{{models.review-survey}}"
-    # No survey pass executes code (issue #403): measured, the `spec` branch ran
-    # the suite whatever the model. Every branch inherits this; a branch may
-    # replace it whole with its own `command_policy`.
-    # `host` (issue #404): measured, two branches scanned the whole disk
-    # (`find / -name SKILL.md`) to recover a lost skill path.
-    command_policy:
-      install: block
-      test: block
-      host: block
-      reason: >-
-        No survey pass executes code. Cite CI from the Context section; where only
-        running the code could settle a field of the evidence record, record it
-        `unknown` — whether falsify probes the row is computed from that record.
-        Nothing outside the checkout counts: never search the machine for a missing
-        dependency or file — stop, and let the hypothesis go to falsify as unprobed.
+  # Three phases that end in `hypotheses/<family>.jsonl` — the rows `site-plan`
+  # clusters into sites:
+  #
+  #   units         deterministic: cut the PR into units (a symbol, a module
+  #                 region, the PR itself) and render each one's COMPLETE
+  #                 request — code, neighbours, obligations, questions, schema.
+  #   survey-units  in-process: ONE bounded, non-agentic model call per unit,
+  #                 concurrently. No sandbox, no tools, no re-deriving with
+  #                 bash what `facts`/`seed` already computed.
+  #   units-ingest  deterministic: validate every response, write the
+  #                 hypothesis rows. A unit that never answered is RECORDED —
+  #                 each obligation it owned gets a row saying so — never
+  #                 dropped.
+  #
+  # `all_done` down the chain, like every deterministic phase here: `units`
+  # always writes a document (the shell fallback included), and `units-ingest`
+  # must run even when the calls failed — that is when it has the most to
+  # record.
+  - name: units
+    label: Units · deterministic
+    type: bash
     skip_if:
       - "analysisEnabled != true"
       - "scratch.reviewTriage.depth == 'light'"
     depends_on: [seed]
     trigger_rule: all_done
-    # A CEILING the run clamps further per backend: gondolin boots a micro-VM
-    # per session and pins to 1; `none` takes all six.
-    max_concurrent: { from: surveyConcurrency, default: 6 }
-    # The fan-out's OWN key. `on_soft_failure` is the `generic_loop` name and
-    # at phase level the schema strips it silently, reverting to
-    # `{retries: 0, then: fail}` — one degenerate turn then fails the review.
+    # `facts`' own budget: the same class of analysis over the same tree, and a
+    # context key rather than a literal like every budget here (#385).
+    timeout_seconds: { from: factsTimeoutSeconds }
+    command: |
+      set -u
+      FACTS="${LASTLIGHT_FACTS_BIN:-$(command -v lastlight-facts || echo /opt/lastlight/bin/lastlight-facts)}"
+      OUT=.lastlight/pr-review/units.json
+      SPEC=.lastlight/pr-review/spec-obligations.json
+      mkdir -p .lastlight/pr-review
+      # A reused per-PR workspace still holds the LAST head's document. Remove
+      # it first, so a process that dies before writing leaves no stale units
+      # for `survey-units` to spend money on.
+      rm -f "$OUT" "$SPEC"
+
+      # The spec obligations are built HARNESS-side (the PR body and the issues
+      # it closes; `review-spec.ts`), so they reach the sandbox only through
+      # this command: the raw set, as the one line of JSON `specContext`
+      # projects, for `units` to cut into units. QUOTED heredoc — nothing in it
+      # is expanded — and the value is one line, so it can never be the
+      # delimiter line. No set (nothing to say, nothing degraded) writes no
+      # file; the `rm` above already removed a stale one.
+      {{#if specObligationsJson}}
+      cat > "$SPEC" <<'LASTLIGHT_SPEC_EOF'
+      {{specObligationsJson}}
+      LASTLIGHT_SPEC_EOF
+      {{/if}}
+      if [ -s "$SPEC" ]; then
+        echo "units: spec obligations written, $(wc -c < "$SPEC") bytes"
+      else
+        echo "units: no spec obligations for this PR"
+      fi
+
+      # The fallback must read downstream as "nothing was cut into units", never
+      # as "there was nothing to survey": `coverage: none`, the reason in
+      # `degraded[]`, and an EMPTY `units` array `survey-units` accepts.
+      fallback() {
+        printf '{"version":1,"generatedAt":"%s","baseSha":null,"headSha":"%s","promptVersion":null,"coverage":"none","degraded":[{"extractor":"units","reason":"%s"}],"responseSchema":null,"units":[]}\n' \
+          "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" "$(git rev-parse HEAD 2>/dev/null || echo unknown)" "$1" > "$OUT"
+      }
+
+      # `--never-fail` covers what the CLI can see; the shell covers a process
+      # that DIES (OOM, a segfault in the native parser). The fallback is
+      # written only when nothing was — a document the CLI wrote on its way to
+      # a non-zero exit carries more than this one can.
+      "$FACTS" units --dir .lastlight/pr-review --repo . --never-fail
+      CODE=$?
+      if [ ! -s "$OUT" ]; then
+        fallback "the units process exited $CODE without writing units.json (OOM, a segfault in the native parser, or a CLI that could not be executed) — NOTHING here may be read as 'no findings'"
+      fi
+      N=$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).units.length)' "$OUT" 2>/dev/null || echo "?")
+      echo "units: exit $CODE, $N unit(s), $(wc -c < "$OUT" 2>/dev/null || echo 0) bytes"
+      exit 0
+
+  # One call per unit, in the HARNESS process (`handlers/survey-units.ts`).
+  # The system prompt of every call is `prompt:` plus the document's
+  # byte-identical `sharedPrefix` (so Anthropic's system-prompt cache
+  # breakpoint covers both), and the user message is the rest of the unit's
+  # request; with no usable prefix, the request goes verbatim. Concurrency is
+  # `review.analysis.surveyUnitConcurrency`. Replies are cached outside the
+  # workspace, keyed on the resolved endpoint, thinking level, system text and
+  # request, so a re-review re-asks only the units whose request changed — and
+  # a reply `units-ingest` judged invalid/partial is evicted before the next
+  # run. One transcript and one `executions` row for the phase.
+  #
+  # It SUCCEEDS on every path inside the phase — no units, no units.json, every
+  # call failing, the deadline — with a loud summary, because a red phase here
+  # posts nothing and re-arms the review sweep, while `units-ingest` already
+  # records every unanswered obligation. The one unsupported setup (kubernetes:
+  # no host checkout) is refused at config load instead — with it, the whole
+  # analysis pipeline.
+  - name: survey-units
+    label: Survey · one call per unit
+    type: survey-units
+    prompt: prompts/survey-unit.md
+    model: "{{models.review-survey}}"
+    # Thinking level, resolved like every agent phase's (`variants.<key>`, then
+    # the resolver's per-phase / catch-all default). Part of the cache key.
+    variant: "{{variants.review-survey}}"
+    # The WHOLE-PHASE deadline (every unit call shares one AbortController);
+    # a unit not finished by then is recorded `ok: false`, "phase deadline".
+    timeout_seconds: { from: surveyUnitsTimeoutSeconds }
+    skip_if:
+      - "analysisEnabled != true"
+      - "scratch.reviewTriage.depth == 'light'"
+    depends_on: [units]
+    trigger_rule: all_done
+
+  - name: units-ingest
+    label: Units · ingest
+    type: bash
+    skip_if:
+      - "analysisEnabled != true"
+      - "scratch.reviewTriage.depth == 'light'"
+    depends_on: [survey-units]
+    trigger_rule: all_done
+    timeout_seconds: { from: seedTimeoutSeconds }
+    command: |
+      set -u
+      FACTS="${LASTLIGHT_FACTS_BIN:-$(command -v lastlight-facts || echo /opt/lastlight/bin/lastlight-facts)}"
+      mkdir -p .lastlight/pr-review/hypotheses
+      if ! "$FACTS" units-ingest --dir .lastlight/pr-review --never-fail; then
+        echo "units-ingest: the ingest process died — hypotheses/ holds whatever it wrote before; site-plan reads what is there"
+      fi
+
+      # The POST-CHECK: every seeded obligation carries a discharge, and every
+      # row gets the canonical id rewrite (issue #405). `spec` is graded
+      # `--ungraded` — its obligations are not in obligations.json.
+      # REPORTED, never failed on: there is no agent to hand a gate failure
+      # back to, and ingest has already written an unanswered row for every
+      # obligation a unit could not answer — a red phase here would only paint
+      # the run red over a gap that is already on the record.
+      for FAMILY in contract enforcement security state spec; do
+        if [ "$FAMILY" = spec ]; then set -- --ungraded; else set --; fi
+        if RESULT="$("$FACTS" discharge --dir .lastlight/pr-review --family "$FAMILY" "$@" 2>&1)"; then
+          echo "discharge $FAMILY: ok"
+        else
+          echo "discharge $FAMILY: NOT satisfied"
+          printf '%s\n' "$RESULT" | head -n 20
+        fi
+      done
+      exit 0
+
+  # ── The `sites` review engine (docs/plans/pr-review-units-sites.md) ──────────
+  #
+  # The hypothesis rows are not the items the review weighs; they are a VOLUME
+  # signal: where many independent units pointed is where an investigator
+  # looks.
+  #
+  #   site-plan    deterministic: rank sites (distinct-unit votes, span ≤ 60,
+  #                test-file sites last), one brief per slot.
+  #   site-review  fan-out: one investigator per selected site writes 1–3
+  #                grounded findings, or a probe-backed `none`.
+  #   merge        deterministic: pool the findings, propose duplicate groups.
+  #   select       one agent call: merge true duplicates, set importance,
+  #                write the comments.
+  #   site-finalize deterministic: `sites --finalize` → findings.json (every
+  #                row `internal`); then `reconcile`'s usual floor.
+  #
+  # `all_done` down the chain: each step must run on whatever the last one
+  # left, and the floor in `reconcile` covers a failed `select`.
+  - name: site-plan
+    label: Sites · plan
+    type: bash
+    skip_if:
+      - "analysisEnabled != true"
+      - "scratch.reviewTriage.depth == 'light'"
+    depends_on: [units-ingest]
+    trigger_rule: all_done
+    timeout_seconds: { from: seedTimeoutSeconds }
+    # Writes `sites/plan.json` and one brief per slot, `sites/site-001.md` …
+    # `site-016.md` (it clears `sites/` first — a reused workspace holds the
+    # last head's). Slots 1–`siteTop` investigate the ranked sites; with
+    # `models.review-site-pair` set, slots 9–(8+`siteTop`) investigate the
+    # same sites again on that model. Every other slot is empty: its brief
+    # says so and its `empty` line is written here, so `site-review`'s
+    # `skip_satisfied_branches` starts no session for it.
+    command: |
+      set -u
+      FACTS="${LASTLIGHT_FACTS_BIN:-$(command -v lastlight-facts || echo /opt/lastlight/bin/lastlight-facts)}"
+      # Test-then-flag: an absent {{key}} renders EMPTY and would swallow the
+      # following flag.
+      TOP="{{siteTop}}"
+      set -- --slots 16
+      [ -n "$TOP" ] && set -- "$@" --top "$TOP"
+      {{#if models.review-site-pair}}set -- "$@" --pair{{/if}}
+      "$FACTS" sites --plan "$@" --dir .lastlight/pr-review --never-fail
+      exit 0
+
+  # One investigator per site, concurrently, in one workspace. The prompt is
+  # slot-generic (a branch has no variables of its own): the attached brief
+  # names the site id, the one file the branch writes
+  # (`sites/<site id>.findings.jsonl` — disjoint across branches, which is the
+  # fan-out's isolation model) and how many probed suspicions a `none` needs.
+  # The gate is the one the evals replay graded (`sites --check`), and
+  # `on_branch_gate_failure` hands its gaps back once — the round-2 feedback the
+  # replay built by hand.
+  - name: site-review
+    label: Sites · investigate
+    type: fanout
+    prompt: prompts/review-site.md
+    # Its own key, falling through to the survey model. The `{{#if}}` pair is
+    # load-bearing: a bare unset key renders EMPTY, and an empty model falls
+    # back to the DEFAULT model rather than to `models.review-survey`.
+    model: "{{#if models.review-site}}{{models.review-site}}{{/if}}{{#if !models.review-site}}{{models.review-survey}}{{/if}}"
+    skip_if:
+      - "analysisEnabled != true"
+      - "scratch.reviewTriage.depth == 'light'"
+    depends_on: [site-plan]
+    trigger_rule: all_done
+    # `review.analysis.siteConcurrency`, clamped per backend (gondolin pins to
+    # 1 — the sites then run in series).
+    max_concurrent: { from: siteConcurrency, default: 6 }
+    # An investigator RUNS code — copied lines under `node`, a differential
+    # `git show` — and that is its evidence. Installing the repo and the suite
+    # are never a probe; scratch installs follow falsify's switch, and `block`
+    # when probes are off (the key is projected only with probes on — the
+    # sites engine does not need them).
+    command_policy:
+      install: block
+      install-scratch: { from: probeScratchInstallPolicy, default: block }
+      test: block
+      host: block
+      reason: >-
+        Installing the repository's dependencies is not this pass's job, and the whole
+        suite is never a probe. Run the one targeted check the site needs (a copied
+        function under `node`, a differential `git show`), or report what you read.
+        Nothing outside the checkout counts.
     on_branch_soft_failure: { retries: 1, then: complete }
-    # A branch whose gate RAN and said no — seeded checks no row names, claim
-    # rows with no evidence record, a zero-obligation family with no claim —
-    # is re-run ONCE with the gate's output as the instruction, then gated
-    # again. Without it the gate only recorded `condition_not_met` and the
-    # half-done file went downstream as if complete (measured: MiniMax M3
-    # answered 2 and 3 of 12 seeded checks on two of eight repeats). One extra
-    # branch turn, only on failure.
     on_branch_gate_failure: { retries: 1 }
-    # `context_file` is read by the HARNESS, host-side, from the cwd the
-    # deterministic phases wrote in, and appended to the branch's prompt — the
-    # model resolves no path of its own. An unreadable file appends a loud NOT
-    # AVAILABLE notice, so a lost seed cannot pass for a clean family.
-    #
-    # `until_bash` checks every obligation carries a discharge code, not merely
-    # that the file is non-empty. It DEGRADES to `test -s` when the obligations
-    # are unreadable or the contract is `minimal`, because a gate an agent
-    # cannot satisfy burns every iteration it has.
+    # `site-plan` wrote every empty slot's `empty` line, so its gate is already
+    # closed: no session for it. Sixteen static branches, of which a PR
+    # typically uses five (top 5, unpaired) to sixteen (top 8, paired).
+    skip_satisfied_branches: true
     branches:
-      - name: contract
-        prompt: prompts/survey-contract.md
-        context_file: .lastlight/pr-review/obligations/contract.md
+      - name: site-001
+        context_file: .lastlight/pr-review/sites/site-001.md
         until_bash: |
           FACTS="${LASTLIGHT_FACTS_BIN:-$(command -v lastlight-facts || echo /opt/lastlight/bin/lastlight-facts)}"
-          "$FACTS" discharge --dir .lastlight/pr-review --family contract
-      - name: enforcement
-        prompt: prompts/survey-enforcement.md
-        context_file: .lastlight/pr-review/obligations/enforcement.md
+          "$FACTS" sites --check site-001 --dir .lastlight/pr-review --repo .
+      - name: site-002
+        context_file: .lastlight/pr-review/sites/site-002.md
         until_bash: |
           FACTS="${LASTLIGHT_FACTS_BIN:-$(command -v lastlight-facts || echo /opt/lastlight/bin/lastlight-facts)}"
-          "$FACTS" discharge --dir .lastlight/pr-review --family enforcement
-      - name: security
-        prompt: prompts/survey-security.md
-        context_file: .lastlight/pr-review/obligations/security.md
+          "$FACTS" sites --check site-002 --dir .lastlight/pr-review --repo .
+      - name: site-003
+        context_file: .lastlight/pr-review/sites/site-003.md
         until_bash: |
           FACTS="${LASTLIGHT_FACTS_BIN:-$(command -v lastlight-facts || echo /opt/lastlight/bin/lastlight-facts)}"
-          "$FACTS" discharge --dir .lastlight/pr-review --family security
-      - name: state
-        prompt: prompts/survey-state.md
-        context_file: .lastlight/pr-review/obligations/state.md
+          "$FACTS" sites --check site-003 --dir .lastlight/pr-review --repo .
+      - name: site-004
+        context_file: .lastlight/pr-review/sites/site-004.md
         until_bash: |
           FACTS="${LASTLIGHT_FACTS_BIN:-$(command -v lastlight-facts || echo /opt/lastlight/bin/lastlight-facts)}"
-          "$FACTS" discharge --dir .lastlight/pr-review --family state
-      # No `tests` branch: the family has no seeder, so it is reported
-      # `notMeasured` rather than run to write NOT MEASURED. `spec` is built
-      # harness-side from the PR body and linked issues, so it reads
-      # `{{specObligations}}` from the context instead of a block on disk —
-      # there is nothing in obligations.json for `discharge` to grade, so it
-      # runs `--ungraded`: the same canonical-id rewrite every branch gets
-      # (issue #405), and the non-empty-file floor it always had.
-      - name: spec
-        prompt: prompts/survey-spec.md
+          "$FACTS" sites --check site-004 --dir .lastlight/pr-review --repo .
+      - name: site-005
+        context_file: .lastlight/pr-review/sites/site-005.md
         until_bash: |
           FACTS="${LASTLIGHT_FACTS_BIN:-$(command -v lastlight-facts || echo /opt/lastlight/bin/lastlight-facts)}"
-          "$FACTS" discharge --dir .lastlight/pr-review --family spec --ungraded
+          "$FACTS" sites --check site-005 --dir .lastlight/pr-review --repo .
+      - name: site-006
+        context_file: .lastlight/pr-review/sites/site-006.md
+        until_bash: |
+          FACTS="${LASTLIGHT_FACTS_BIN:-$(command -v lastlight-facts || echo /opt/lastlight/bin/lastlight-facts)}"
+          "$FACTS" sites --check site-006 --dir .lastlight/pr-review --repo .
+      - name: site-007
+        context_file: .lastlight/pr-review/sites/site-007.md
+        until_bash: |
+          FACTS="${LASTLIGHT_FACTS_BIN:-$(command -v lastlight-facts || echo /opt/lastlight/bin/lastlight-facts)}"
+          "$FACTS" sites --check site-007 --dir .lastlight/pr-review --repo .
+      - name: site-008
+        context_file: .lastlight/pr-review/sites/site-008.md
+        until_bash: |
+          FACTS="${LASTLIGHT_FACTS_BIN:-$(command -v lastlight-facts || echo /opt/lastlight/bin/lastlight-facts)}"
+          "$FACTS" sites --check site-008 --dir .lastlight/pr-review --repo .
+      # Slots 9–16: the second investigator of ranks 1–8, on
+      # `models.review-site-pair`. Empty (and never started) unless it is set.
+      - name: site-009
+        model: "{{models.review-site-pair}}"
+        context_file: .lastlight/pr-review/sites/site-009.md
+        until_bash: |
+          FACTS="${LASTLIGHT_FACTS_BIN:-$(command -v lastlight-facts || echo /opt/lastlight/bin/lastlight-facts)}"
+          "$FACTS" sites --check site-009 --dir .lastlight/pr-review --repo .
+      - name: site-010
+        model: "{{models.review-site-pair}}"
+        context_file: .lastlight/pr-review/sites/site-010.md
+        until_bash: |
+          FACTS="${LASTLIGHT_FACTS_BIN:-$(command -v lastlight-facts || echo /opt/lastlight/bin/lastlight-facts)}"
+          "$FACTS" sites --check site-010 --dir .lastlight/pr-review --repo .
+      - name: site-011
+        model: "{{models.review-site-pair}}"
+        context_file: .lastlight/pr-review/sites/site-011.md
+        until_bash: |
+          FACTS="${LASTLIGHT_FACTS_BIN:-$(command -v lastlight-facts || echo /opt/lastlight/bin/lastlight-facts)}"
+          "$FACTS" sites --check site-011 --dir .lastlight/pr-review --repo .
+      - name: site-012
+        model: "{{models.review-site-pair}}"
+        context_file: .lastlight/pr-review/sites/site-012.md
+        until_bash: |
+          FACTS="${LASTLIGHT_FACTS_BIN:-$(command -v lastlight-facts || echo /opt/lastlight/bin/lastlight-facts)}"
+          "$FACTS" sites --check site-012 --dir .lastlight/pr-review --repo .
+      - name: site-013
+        model: "{{models.review-site-pair}}"
+        context_file: .lastlight/pr-review/sites/site-013.md
+        until_bash: |
+          FACTS="${LASTLIGHT_FACTS_BIN:-$(command -v lastlight-facts || echo /opt/lastlight/bin/lastlight-facts)}"
+          "$FACTS" sites --check site-013 --dir .lastlight/pr-review --repo .
+      - name: site-014
+        model: "{{models.review-site-pair}}"
+        context_file: .lastlight/pr-review/sites/site-014.md
+        until_bash: |
+          FACTS="${LASTLIGHT_FACTS_BIN:-$(command -v lastlight-facts || echo /opt/lastlight/bin/lastlight-facts)}"
+          "$FACTS" sites --check site-014 --dir .lastlight/pr-review --repo .
+      - name: site-015
+        model: "{{models.review-site-pair}}"
+        context_file: .lastlight/pr-review/sites/site-015.md
+        until_bash: |
+          FACTS="${LASTLIGHT_FACTS_BIN:-$(command -v lastlight-facts || echo /opt/lastlight/bin/lastlight-facts)}"
+          "$FACTS" sites --check site-015 --dir .lastlight/pr-review --repo .
+      - name: site-016
+        model: "{{models.review-site-pair}}"
+        context_file: .lastlight/pr-review/sites/site-016.md
+        until_bash: |
+          FACTS="${LASTLIGHT_FACTS_BIN:-$(command -v lastlight-facts || echo /opt/lastlight/bin/lastlight-facts)}"
+          "$FACTS" sites --check site-016 --dir .lastlight/pr-review --repo .
+  # Pool every site's findings for `select`: numbered `F1…Fn`, each with an
+  # excerpt, and the duplicate groups line proximity PROPOSES (it cannot decide
+  # "same defect"; no rule here reads prose). STDOUT is the delivery mechanism
+  # — `output_var` puts it in the select prompt — and `sites/merged.json` is
+  # what `--finalize` reads.
+  - name: merge
+    label: Sites · merge
+    type: bash
+    skip_if:
+      - "analysisEnabled != true"
+      - "scratch.reviewTriage.depth == 'light'"
+    depends_on: [site-review]
+    trigger_rule: all_done
+    output_var: siteMerge
+    timeout_seconds: { from: reconcileTimeoutSeconds }
+    command: |
+      set -u
+      FACTS="${LASTLIGHT_FACTS_BIN:-$(command -v lastlight-facts || echo /opt/lastlight/bin/lastlight-facts)}"
+      if ! "$FACTS" sites --merge --dir .lastlight/pr-review --repo . --never-fail; then
+        echo "MERGE NOT AVAILABLE — \`lastlight-facts sites --merge\` failed. Write {\"items\": []}."
+      fi
+      exit 0
+
+  # One agent call over at most ~15 findings: merge true duplicates, set
+  # importance, write the comments to `sites/selected.json`. The gate is
+  # conservation — every pooled finding in exactly one item — so selecting can
+  # merge and demote (`nit` is recorded, never posted) but never silently drop.
+  # A selection that never closes is not fatal: `sites --finalize` falls back
+  # to one item per finding at the investigator's own importance.
+  #
+  # Skipped when `merge` pooled nothing (its FIRST line is `SITE_MERGE_EMPTY`;
+  # `startsWith`, because a finding's code excerpt can quote the marker): the one
+  # correct selection is empty, `--finalize` falls back to the empty pool, and
+  # an agent asked to write it wrote the file and then an empty completion,
+  # failing the phase and its retry. A resumed run has no `siteMerge` output
+  # (a dedup skip returns none), so select runs — the safe direction.
+  - name: select
+    label: Sites · select
+    prompt: prompts/review-select.md
+    model: "{{#if models.review-select}}{{models.review-select}}{{/if}}{{#if !models.review-select}}{{models.review}}{{/if}}"
+    variant: "{{variants.review}}"
+    skip_if:
+      - "analysisEnabled != true"
+      - "scratch.reviewTriage.depth == 'light'"
+      - "phaseOutputs.siteMerge.startsWith('SITE_MERGE_EMPTY')"
+    depends_on: [merge]
+    trigger_rule: all_done
+    command_policy:
+      install: block
+      test: block
+      host: block
+      reason: >-
+        This phase selects; it does not verify. The investigators already ran their
+        probes — read their findings above, and the code only to decide whether two
+        findings are the same defect.
+    generic_loop:
+      on_soft_failure: { retries: 1, then: complete }
+      max_iterations: 2
+      fresh_context: true
+      until_bash: |
+        FACTS="${LASTLIGHT_FACTS_BIN:-$(command -v lastlight-facts || echo /opt/lastlight/bin/lastlight-facts)}"
+        "$FACTS" sites --check-select --dir .lastlight/pr-review
+
+  # `select`'s file → findings.json, the shape `post-review` reads: each item at
+  # its primary finding's location (with the line's text as `existingCode`, so
+  # the poster anchors it), severity from importance (must-fix outranks
+  # worth-mentioning for the inline slots; a `nit` is filed `internal`), and
+  # every hypothesis row by id in `internal[]` — the rows are the volume
+  # record, and `reconcile`'s conservation check then holds. A missing or
+  # invalid selection falls back to one item per site finding at the
+  # investigator's own importance, so a failed `select` still posts.
+  - name: site-finalize
+    label: Sites · findings.json
+    type: bash
+    skip_if:
+      - "analysisEnabled != true"
+      - "scratch.reviewTriage.depth == 'light'"
+    depends_on: [select]
+    trigger_rule: all_done
+    timeout_seconds: { from: reconcileTimeoutSeconds }
+    command: |
+      set -u
+      FACTS="${LASTLIGHT_FACTS_BIN:-$(command -v lastlight-facts || echo /opt/lastlight/bin/lastlight-facts)}"
+      if ! "$FACTS" sites --finalize --dir .lastlight/pr-review --repo .; then
+        echo "site-finalize: sites --finalize failed; reconcile's floor files every hypothesis internal"
+      fi
+      exit 0
+
+  # WHICH hypotheses `falsify` owes a verdict on — decided in code, not by the
+  # oracle. `lastlight-facts probe-plan` derives the owed set (a derived-Critical
+  # row, or a survey's own `needsProbe`), ranks it and caps it at
+  # `review.analysis.maxProbes`, writing `probes/plan.json` (the `probes` gate
+  # owes exactly that list) and `probes/plan.md` (the records falsify reads).
+  # The prompt used to say "probe every row whose severity is Critical", and a
+  # derived severity is never written on a row: measured 2026-09-27, the gate
+  # owed 21 rows on one case and falsify probed one. `--never-fail`: with no
+  # plan on disk the gate and the prompt fall back to the pre-plan owed set, so
+  # a failure here costs the cap, never a probe.
+  - name: probe-plan
+    label: Falsify · plan the probes
+    type: bash
+    skip_if:
+      - "analysisEnabled != true"
+      - "probesEnabled != true"
+      - "falsifyAttached != true"
+      - "scratch.reviewTriage.depth == 'light'"
+    depends_on: [units-ingest]
+    trigger_rule: all_done
+    timeout_seconds: { from: seedTimeoutSeconds }
+    command: |
+      set -u
+      FACTS="${LASTLIGHT_FACTS_BIN:-$(command -v lastlight-facts || echo /opt/lastlight/bin/lastlight-facts)}"
+      MAX_PROBES="{{maxProbes}}"
+      if [ -z "$MAX_PROBES" ] || [ "$MAX_PROBES" = "null" ]; then set --; else set -- --max-probes "$MAX_PROBES"; fi
+      "$FACTS" probe-plan --dir .lastlight/pr-review "$@" --never-fail
 
   # The only phase that RUNS anything. It reads the hypothesis RECORDS and the
   # code, never an earlier pass's transcript — a checker that can see the
@@ -312,19 +662,18 @@ phases:
   - name: falsify
     label: Falsify · run the probe
     prompt: prompts/review-falsify.md
-    # Its OWN key, falling through to `models.review-survey`. Hard-wiring the
-    # survey key meant the oracle's model could not be moved without moving all
-    # five survey branches with it — two variables, so "is a cheap model good
-    # enough at WRITING AND RUNNING a probe?" was not a runnable experiment.
-    # The `{{#if}}` pair is load-bearing, exactly as on `adjudicate` below: a
-    # bare unset `{{models.review-falsify}}` renders EMPTY, and an empty model
-    # falls back to the DEFAULT model rather than to `models.review-survey`.
+    # Its OWN key, falling through to `models.review-survey`, so the oracle's
+    # model moves without the survey's. The `{{#if}}` pair is load-bearing, as
+    # on `site-review`.
     model: "{{#if models.review-falsify}}{{models.review-falsify}}{{/if}}{{#if !models.review-falsify}}{{models.review-survey}}{{/if}}"
     skip_if:
       - "analysisEnabled != true"
       - "probesEnabled != true"
+      - "falsifyAttached != true"
       - "scratch.reviewTriage.depth == 'light'"
-    depends_on: [survey]
+    # `all_done`: a FAILED plan step never stopped falsify, which then reads
+    # the pre-plan owed set (see `probe-plan` above).
+    depends_on: [probe-plan]
     trigger_rule: all_done
     # A WHOLE-PHASE ceiling, across every round. `probeRounds` bounds how many
     # times the loop may go round and not what it may spend, and this is the
@@ -366,18 +715,29 @@ phases:
         "$FACTS" probes --dir .lastlight/pr-review
 
   # Writes findings to `.lastlight/pr-review/findings.json` — content only —
-  # and never submits; `post-review` below does that. With the pipeline on the
-  # brief collapses to one fast independent pass, since the surveys have
-  # already done the deep work.
+  # and never submits; `post-review` below does that. Two arms of one prompt:
+  # the whole review with the pipeline OFF (`baseline`), and the single pass a
+  # `light` re-review gets.
+  #
+  # With the pipeline ON it does not run: `site-finalize` writes findings.json.
+  # The guard is ONE scratch flag because `skip_if` lists are OR-ed and the
+  # condition is an AND — pipeline on, depth not `light`. `runner.ts` seeds
+  # `skipReview` for the first, and the light harvest REPLACES the namespace,
+  # which drops the flag: a light review runs this phase. A context-key guard
+  # would survive the harvest, and a light review would then post nothing.
+  # Bare `== true`, so an absent flag (a run seeded before the key existed, a
+  # failed seed) runs the review — the direction every failure here points.
   - name: review
     label: Review
     # EXPLICIT: declaring `depends_on` anywhere disables the synthesized linear
     # chain for the WHOLE workflow, so without these two lines `review` and
-    # `post-review` become roots and run in parallel with the surveys. And
+    # `post-review` become roots and run in parallel with the pipeline. And
     # `all_done`, because with `all_success` they would be skipped on every
     # deployment that has not enabled the pipeline.
-    depends_on: [falsify]
+    depends_on: [site-finalize, falsify]
     trigger_rule: all_done
+    skip_if:
+      - "scratch.reviewTriage.skipReview == true"
     prompt: prompts/review.md
     skills: [pr-review, code-review]
     model: "{{models.review}}"
@@ -385,8 +745,8 @@ phases:
     # Review re-created CI by hand (`npm ci` then `npm run lint:check && npm
     # test`) although `{{ciSection}}` already carries the result (issue #403),
     # so the suite is blocked everywhere. An INSTALL is blocked only when the
-    # evidence pipeline is on: then `prepare`/`falsify` own execution and this
-    # pass is an abbreviated read. With it off this is the whole review, and the
+    # evidence pipeline is on — a light re-review there is a focused read. With
+    # it off this is the whole review, and the
     # `pr-review` skill's install-to-probe affordance is a measured fix (it is
     # why the reviewer could open `node_modules/@slack` at all), so it stays.
     command_policy:
@@ -395,184 +755,34 @@ phases:
       host: block
       reason: >-
         This phase does not run the build, the linter or the test suite: CI already
-        answered those, in the Context section. Cite it, or report the claim for the
-        adjudicator to weigh. Nothing outside the checkout counts: never search the
+        answered those, in the Context section. Cite it, or report the claim as
+        unverified. Nothing outside the checkout counts: never search the
         machine for a missing dependency — stop, and leave the claim unprobed.
 
-  # #399 idea 2. One TypeSafe `systemOne` call PER HYPOTHESIS (not per
-  # finding — hypotheses vastly outnumber findings, and per-hypothesis is the
-  # volume a System-1 primitive is for), asking only the category axis
-  # measured at AUC 0.897 (never correctness, measured dead at AUC 0.534).
-  # Writes `.lastlight/pr-review/jev.json`, which `dossier` below renders as
-  # an ADVISORY line per hypothesis — `adjudicate` still writes every
-  # disposition itself. Measured 2026-09-22: 260 hypotheses / 8 cases, 83.6%
-  # agreement with Sonnet's own adjudicate call on identical evidence,
-  # $0.0053 — weakest on the rarest, highest-stakes categories, which is why
-  # this annotates rather than decides.
+  # The conservation floor under `site-finalize`: `--repair` writes every
+  # hypothesis findings.json does not account for at `internal` tier, so a
+  # failed or partial finalize never loses a row. Idempotent, model-free, and
+  # exits 0 on every path.
   #
-  # `dossier` depends on this PHASE (not just on the file it writes) so the
-  # DAG itself enforces the ordering the render call needs — `jev.json` must
-  # exist before `dossier --json`'s underlying render reads it.
-  #
-  # `|| true`: no `TYPESAFE_KEY`, a network error, a malformed answer — all of
-  # it degrades to "no annotation" inside the CLI command itself (see
-  # `jev-classify.ts`), and this phase must never fail the run on a third
-  # party's API health that `legacy`/`dossier` deployments never needed at all.
-  - name: jev-classify
-    label: System-1 per-hypothesis pre-read
-    type: bash
-    skip_if:
-      - "analysisEnabled != true"
-      - "jevClassifyEnabled != true"
-      - "scratch.reviewTriage.depth == 'light'"
-    depends_on: [review]
-    trigger_rule: all_done
-    timeout_seconds: { from: jevTimeoutSeconds }
-    command: |
-      set -u
-      FACTS="${LASTLIGHT_FACTS_BIN:-$(command -v lastlight-facts || echo /opt/lastlight/bin/lastlight-facts)}"
-      "$FACTS" jev-classify --dir .lastlight/pr-review --repo . \
-        {{#if jevModel}}--model "{{jevModel}}"{{/if}} || true
-
-  # #399. Every record `adjudicate` needs, joined and quote-checked ONCE, by
-  # code, instead of thirty shell calls inside the phase.
-  #
-  # Measured on the 8-case probes arm: `adjudicate` made 137 bash calls across
-  # 8 adjudications — 35 turns and 30 bash on `1587-r2`, one `write`, about a
-  # third of case cost — `cat`-ing hypothesis files `readHypothesisSet` had
-  # parsed, transcripts `checkProbes` had located, the ledger twice, and dozens
-  # of `sed -n '<N>p'` re-reads to check quotes it was handed.
-  #
-  # It goes to STDOUT as well as to disk, and that is the delivery mechanism:
-  # `output_var` puts it in `{{phaseOutputs.dossier.output}}`, which
-  # `review-adjudicate.md` interpolates. The alternative — a path in the prompt
-  # — is the failure `context_file` exists to remove: of 120 non-spec survey
-  # branches, 27 first-turn reads of a prompt-named path resolved against the
-  # wrong root and hit ENOENT, and 23 never recovered. The on-disk copy is for
-  # the eval harness's artifact capture and for the one case the dossier
-  # deliberately does not inline in full, a truncated probe transcript.
-  #
-  # `|| true` and a fallback line for the same reason every deterministic phase
-  # here has one: a non-zero exit fails the phase, and this is an input, not a
-  # gate. An adjudication with no dossier is the shipped phase; an adjudication
-  # that never ran is a review that never posts.
-  - name: dossier
-    label: Adjudication dossier
-    type: bash
-    skip_if:
-      - "analysisEnabled != true"
-      - "dossierEnabled != true"
-      - "scratch.reviewTriage.depth == 'light'"
-    # `jev-classify` too, not just `review` — `all_done` already tolerates a
-    # skipped dependency (it is what `review` itself already relies on here;
-    # the stricter `none_failed_min_one_success` below is for `adjudicate`,
-    # which must not run if `review` genuinely FAILED). Declaring the
-    # dependency is what makes the DAG run `jev-classify` to completion (or
-    # skip) before this phase reads the file it writes.
-    depends_on: [review, jev-classify]
-    trigger_rule: all_done
-    output_var: dossier
-    timeout_seconds: { from: reconcileTimeoutSeconds }
-    command: |
-      set -u
-      FACTS="${LASTLIGHT_FACTS_BIN:-$(command -v lastlight-facts || echo /opt/lastlight/bin/lastlight-facts)}"
-      "$FACTS" dossier --dir .lastlight/pr-review --repo . \
-        --out .lastlight/pr-review/dossier.md || true
-      if [ -s .lastlight/pr-review/dossier.md ]; then
-        cat .lastlight/pr-review/dossier.md
-      else
-        echo "DOSSIER NOT AVAILABLE — \`lastlight-facts dossier\` produced nothing."
-        echo "Read .lastlight/pr-review/ yourself: hypotheses/*.jsonl, probes/verdicts.jsonl,"
-        echo "probes/*.txt, findings.json, and \`lastlight-facts findings --ledger\`."
-      fi
-
-  # The exit of the funnel, and the only phase that can move recall: it ranks,
-  # re-tiers and demotes the hypotheses into the review. It DELETES only when a
-  # probe transcript refutes a claim.
-  #
-  # A SIBLING of `post-review`, not a link in its chain. `trigger_rule` is
-  # per-node, so folding it into `post-review`'s deps would force that node to
-  # `all_done` and lose the invariant that a FAILED REVIEW MUST NOT POST.
-  # Declared first, so the sequential scheduler still runs it first.
-  - name: adjudicate
-    label: Adjudicate
-    skills: [adjudicate-pass]
-    prompt: prompts/review-adjudicate.md
-    # The `{{#if}}` pair is load-bearing: a bare unset `{{models.review-adjudicate}}`
-    # renders EMPTY, and an empty model falls back to the DEFAULT model rather
-    # than to `models.review`.
-    model: "{{#if models.review-adjudicate}}{{models.review-adjudicate}}{{/if}}{{#if !models.review-adjudicate}}{{models.review}}{{/if}}"
-    variant: "{{variants.review}}"
-    command_policy:
-      install: block
-      test: block
-      host: block
-      reason: >-
-        This phase does not execute code. Weigh the probe transcripts falsify already
-        wrote and the CI result in the Context section; an unsettled claim is demoted,
-        not re-run. Nothing outside the checkout counts: never search the machine for
-        a missing dependency — the hypothesis stays unprobed.
-    skip_if:
-      - "analysisEnabled != true"
-      - "scratch.reviewTriage.depth == 'light'"
-    # `none_failed_min_one_success`, NOT `all_success`, and the difference is
-    # load-bearing in both directions:
-    #
-    #   - a FAILED review must still not post, and it does not: a failed dep
-    #     fails this rule exactly as it fails `all_success`;
-    #   - a SKIPPED `dossier` must not take this phase down with it, and under
-    #     `all_success` it WOULD. `evaluateTriggerRule` requires every dep to be
-    #     literally `succeeded`, and `skip_if` sets `skipped`
-    #     (`scheduler.ts` — "Uses the same non-failing skip mechanics"), so on
-    #     every deployment left on `review.analysis.adjudicate: legacy` the
-    #     dossier skips and `all_success` would silently skip the adjudicator
-    #     with it. The whole pipeline would go quiet with no phase failing.
-    #
-    # Declaring the dependency at all is what ORDERS the dossier before this
-    # phase. The sequential scheduler happens to run the earliest-declared ready
-    # node, so declaration order alone would work today — but a data dependency
-    # that survives only until someone reorders the file is not a dependency.
-    depends_on: [review, dossier]
-    trigger_rule: none_failed_min_one_success
-    generic_loop:
-      on_soft_failure: { retries: 1, then: complete }
-      max_iterations: 2
-      fresh_context: true
-      # The CONSERVATION gate: every hypothesis id must appear with exactly one
-      # disposition, and a `dropped` one must name a transcript that EXISTS.
-      # Silent omission is impossible by construction rather than by
-      # instruction. Literal shell — no `{{` markers allowed.
-      until_bash: |
-        FACTS="${LASTLIGHT_FACTS_BIN:-$(command -v lastlight-facts || echo /opt/lastlight/bin/lastlight-facts)}"
-        "$FACTS" findings --dir .lastlight/pr-review
-
-  # The floor under that gate: reaching `max_iterations` unsatisfied is not a
-  # phase failure in this engine, so hypotheses would otherwise go unaccounted
-  # for. `--repair` writes every uncovered hypothesis into findings.json at
-  # `internal` tier and promotes back any `dropped` entry whose transcript does
-  # not exist. Idempotent, model-free, and exits 0 on every path.
-  #
-  # It is also where a finding's SEVERITY is derived (issue #405): every
-  # hypothesis-derived finding gets the severity its evidence records and probe
-  # verdicts imply (`finding-severity.ts`), stamped over whatever `adjudicate`
-  # wrote — which is the mechanism behind "the adjudicator does not choose it".
-  # `post-review` ranks both posting budgets on that value.
+  # It is also where a hypothesis-derived finding's SEVERITY is derived (issue
+  # #405): the severity its evidence records and probe verdicts imply
+  # (`finding-severity.ts`). `post-review` ranks both posting budgets on it.
   - name: reconcile
     label: Reconcile · the conservation floor
     type: bash
     skip_if:
       - "analysisEnabled != true"
       - "scratch.reviewTriage.depth == 'light'"
-    depends_on: [adjudicate]
-    # `all_done`: the floor must apply even when the adjudicator failed — that
-    # is precisely when there is something to repair.
+    depends_on: [site-finalize]
+    # `all_done`: the floor must apply even when finalize failed — that is
+    # precisely when there is something to repair.
     trigger_rule: all_done
     timeout_seconds: { from: reconcileTimeoutSeconds }
     command: |
       set -u
       FACTS="${LASTLIGHT_FACTS_BIN:-$(command -v lastlight-facts || echo /opt/lastlight/bin/lastlight-facts)}"
       if ! "$FACTS" findings --dir .lastlight/pr-review --repair; then
-        echo "reconcile: could not repair findings.json; it stands as the review phase wrote it"
+        echo "reconcile: could not repair findings.json; it stands as site-finalize wrote it"
       fi
       exit 0
 
@@ -581,7 +791,25 @@ phases:
   # and diff — so the agent never hand-copies metadata. Anchors each finding to
   # a changed line, demotes off-diff findings to the body, and posts one
   # review. Idempotent on resume.
+  #
+  # `none_failed` on `review` alone:
+  #
+  #   - a FAILED `review` never posts — a failed dep fails the rule;
+  #   - a `review` SKIPPED by its own guard (pipeline on) posts what
+  #     `site-finalize` + `reconcile` wrote — the default rule, `all_success`,
+  #     would skip this phase with it and post nothing;
+  #   - a failed `select`, `site-finalize` or `reconcile` still posts —
+  #     the money property: a red run that posts nothing leaves both per-head
+  #     dedups blank, and the thirty-minute sweep re-buys the whole pipeline
+  #     on the same SHA forever. That is why this does NOT also depend on
+  #     `reconcile`: `none_failed_min_one_success` over both would withhold the
+  #     post whenever `reconcile` itself failed.
+  #
+  # So the floor runs before the post by DECLARATION ORDER — every pipeline
+  # phase is declared earlier and the sequential scheduler takes the earliest
+  # ready node — exactly as it did while `review` always ran.
   - name: post-review
     label: Post inline review
     type: post-review
     depends_on: [review]
+    trigger_rule: none_failed

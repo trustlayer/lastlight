@@ -1,0 +1,297 @@
+/**
+ * The unit-survey index — what `/api/unit-survey` lists, and the per-case view
+ * the dashboard's detail page renders — derived from the reports
+ * `scripts/unit-survey-replay.ts` writes to `eval-results/unit-survey/*.json`.
+ *
+ * **Node-free**, like `micro-survey.ts`: the fs scan (`buildUnitSurveyIndex` in
+ * `report.ts`) and the browser share this one definition, so the list and the
+ * detail page cannot disagree about a number. The report SHAPE is imported
+ * type-only from `unit-survey-replay.ts` (which is Node-side — it reads
+ * transcripts — so it is never imported at runtime here).
+ *
+ * One rule every function below keeps: **absent is not zero.** A stage-1 report
+ * has no model side at all; a case whose judge failed has `asserted: null`; a
+ * fixture whose transcripts carried no `survey_branch_*` result lines has no
+ * agent wall clock and no agent cost (its `costUsd: 0` is a sum over nothing).
+ * Each of those is `null` here and renders "n/a" — a 0 would read as a measured
+ * zero recall or a free, instant survey.
+ */
+import { MICRO_STALE_HEARTBEAT_MS, type MicroGoldRef, type MicroGoldRepeat } from "./micro-survey.js";
+import type { ReplayCase, ReplayModelRun, ReplayReport, ReplayWriteStatus } from "./unit-survey-replay.js";
+
+export type {
+  ReplayCase,
+  ReplayModelRun,
+  ReplayPlannedCase,
+  ReplayReport,
+  ReplayWriteStatus,
+} from "./unit-survey-replay.js";
+
+/** The directory `scripts/unit-survey-replay.ts` writes into, under
+ * `eval-results/`. Loose report files plus a `responses/` subdirectory of kept
+ * raw unit replies — which is not a report and must never be listed as one. */
+export const UNIT_SURVEY_DIR = "unit-survey";
+
+/** The stage-2 roll-up of one report, recomputed from its cases. */
+export interface UnitSurveyModelTotals {
+  /** Cases with a model run that did not error. */
+  cases: number;
+  gold: number;
+  /** Judge-credited gold (`asserted`), summed. `null` if ANY case's side was unjudged. */
+  unitsAsserted: number | null;
+  agentAsserted: number | null;
+  onlyUnits: number;
+  onlyAgent: number;
+  unitsCostUsd: number;
+  /** `null` when any case's fixture recorded no agent survey branches. */
+  agentCostUsd: number | null;
+  unitsWallMs: number;
+  agentWallMs: number | null;
+  /** Distinct unit-survey models / judge models / judge vote counts seen. */
+  models: string[];
+  judgeModels: (string | null)[];
+  votes: number[];
+}
+
+/**
+ * The four states a report can be in — derived here, not in the dashboard, so
+ * the index, the list, the detail page and the home page cannot disagree.
+ *
+ *  - `done` — the final write landed (`status: "done"`), OR the report has no
+ *    `status` at all: every report written before live writes was written once,
+ *    at the end, and really was finished when it landed.
+ *  - `failed` — the run itself threw and said so (`status: "failed"`, `error`).
+ *  - `running` — `status: "running"` with a heartbeat fresher than the
+ *    micro-survey's staleness bar ({@link MICRO_STALE_HEARTBEAT_MS}, 90 s; the
+ *    script ticks every 15 s).
+ *  - `stale` — `status: "running"` but nobody has written for longer than that:
+ *    the script was killed. **Silence is rendered as silence**, never as a run
+ *    still in progress — including a `running` report with no parsable heartbeat.
+ */
+export type UnitSurveyStatus = "running" | "done" | "failed" | "stale";
+
+export function unitSurveyStatus(
+  r: { status?: ReplayWriteStatus | string | null; heartbeat?: string | null },
+  nowMs: number,
+): UnitSurveyStatus {
+  if (r?.status === "failed") return "failed";
+  if (r?.status !== "running") return "done";
+  const beat = typeof r.heartbeat === "string" ? Date.parse(r.heartbeat) : Number.NaN;
+  if (!Number.isFinite(beat)) return "stale";
+  return nowMs - beat > MICRO_STALE_HEARTBEAT_MS ? "stale" : "running";
+}
+
+/** A report whose totals are over the cases done SO FAR (running, or killed
+ * mid-run) — every aggregate on it must be labelled partial. */
+export const isPartialStatus = (s: UnitSurveyStatus): boolean => s === "running" || s === "stale";
+
+/**
+ * How long the replay has run: to `finishedAt` when it finalised, to its last
+ * heartbeat when it died without finalising (the time after is silence, not
+ * work), and to `nowMs` while it is running. `null` when the start is unknown.
+ */
+export function unitSurveyElapsedMs(
+  e: Pick<UnitSurveyEntry, "generatedAt" | "finishedAt" | "heartbeat" | "status">,
+  nowMs: number,
+): number | null {
+  const start = Date.parse(e.generatedAt);
+  if (!Number.isFinite(start)) return null;
+  const s = unitSurveyStatus(e, nowMs);
+  const endIso = s === "running" ? null : (e.finishedAt ?? e.heartbeat);
+  const end = endIso === null ? nowMs : Date.parse(endIso ?? "");
+  return Number.isFinite(end) ? Math.max(0, end - start) : null;
+}
+
+/** One report as the index lists it. */
+export interface UnitSurveyEntry {
+  /** Filename without `.json`; the id in the URL. */
+  id: string;
+  /** Where the full report is, for the detail view (`/data/unit-survey/…`). */
+  report: string;
+  /** `startedAt` from the report, else the filename stamp, else the mtime. */
+  generatedAt: string;
+  finishedAt: string | null;
+  /** The writer's own word — `done` when the report has no `status` (pre-live
+   * reports). Read it only through {@link unitSurveyStatus}: a `running` file
+   * whose writer died stays `running` forever. */
+  status: ReplayWriteStatus;
+  heartbeat: string | null;
+  /** Cases the run set out to replay; `null` on a report that predates the plan
+   * (its `cases` is then the whole run). */
+  planned: number | null;
+  /** Why a `failed` run failed. */
+  error: string | null;
+  label: string;
+  /** `coverage` = stage 1 only ($0); `replay` = stage 2 ran on some case. */
+  stage: "coverage" | "replay";
+  /** Cases in the file, and how many of them errored. */
+  cases: number;
+  errored: number;
+  /** Distinct arms (fixture parent dirs) the cases came from. */
+  arms: string[];
+  promptVersion: string | null;
+  /** Stage-1 coverage over the non-errored cases: gold SHOWN by some unit / locatable. */
+  coverage: { covered: number; locatable: number; gold: number; unlocatable: number };
+  units: number;
+  requestChars: number;
+  truncated: number;
+  /** `null` on a stage-1 report — there is no model side to total. */
+  model: UnitSurveyModelTotals | null;
+}
+
+export interface UnitSurveyIndex {
+  generatedAt: string;
+  reports: UnitSurveyEntry[];
+}
+
+const sum = (xs: number[]): number => xs.reduce((a, b) => a + b, 0);
+const isNum = (x: unknown): x is number => typeof x === "number" && Number.isFinite(x);
+
+/** `2026-09-27T10-10-15-249Z-label` → `2026-09-27T10:10:15.249Z`, else `null`. */
+export function parseUnitSurveyStamp(id: string): string | null {
+  const m = /^(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})-(\d{3})Z/.exec(id);
+  return m ? `${m[1]}T${m[2]}:${m[3]}:${m[4]}.${m[5]}Z` : null;
+}
+
+/** The arm a case came from — the report's own `arm`, which the script takes
+ * from the fixture's parent directory. */
+const armOf = (c: ReplayCase): string => (typeof c.arm === "string" && c.arm ? c.arm : "?");
+
+/** A case's model run, if it ran and did not error. */
+export function okModel(c: ReplayCase): ReplayModelRun | null {
+  return !c.error && c.model && !c.model.error ? c.model : null;
+}
+
+/** The agent side's survey cost, or `null` when the fixture recorded no branch
+ * (the report's `costUsd` is then a sum over nothing, not a free survey). */
+export function agentCost(m: ReplayModelRun): number | null {
+  return m.agentSurvey && Array.isArray(m.agentSurvey.branches) && m.agentSurvey.branches.length > 0
+    ? m.agentSurvey.costUsd
+    : null;
+}
+
+export function agentWall(m: ReplayModelRun): number | null {
+  return isNum(m.agentSurvey?.wallMs) ? m.agentSurvey.wallMs : null;
+}
+
+/** Judge-credited gold for one side, `null` when that side was not judged. */
+export function assertedOf(s: MicroGoldRepeat | null | undefined): number | null {
+  return s && isNum(s.asserted) ? s.asserted : null;
+}
+
+/**
+ * The stage-2 totals, RECOMPUTED from the cases rather than copied from the
+ * report's `aggregate.model` — which sums the agent's `costUsd` even where the
+ * fixture recorded no branch (a 0 that means "unknown"). `null` when no case
+ * ran a model.
+ */
+export function modelTotals(cases: ReplayCase[]): UnitSurveyModelTotals | null {
+  const withModel = cases.flatMap((c) => {
+    const m = okModel(c);
+    return m ? [{ c, m }] : [];
+  });
+  if (!withModel.length) return null;
+  const nullableSum = (xs: (number | null)[]): number | null => (xs.some((x) => x === null) ? null : sum(xs as number[]));
+  const uniq = <T,>(xs: T[]): T[] => [...new Set(xs)];
+  const scored = withModel.filter(({ c }) => Array.isArray(c.gold) && c.gold.length > 0);
+  return {
+    cases: withModel.length,
+    gold: sum(withModel.map(({ c }) => (Array.isArray(c.gold) ? c.gold.length : 0))),
+    // Credited gold sums over the cases that HAVE gold. A no-gold case (1641)
+    // is never judged, so its score is null — that is "nothing to score", not
+    // "this side was not judged", and letting it through nulled every
+    // finished report's total while a running one (no 1641 yet) showed numbers.
+    unitsAsserted: nullableSum(scored.map(({ m }) => assertedOf(m.unitsScore))),
+    agentAsserted: nullableSum(scored.map(({ m }) => assertedOf(m.agentScore))),
+    onlyUnits: sum(withModel.map(({ m }) => m.sides?.onlyUnits?.length ?? 0)),
+    onlyAgent: sum(withModel.map(({ m }) => m.sides?.onlyAgent?.length ?? 0)),
+    unitsCostUsd: sum(withModel.map(({ m }) => (isNum(m.costUsd) ? m.costUsd : 0))),
+    agentCostUsd: nullableSum(withModel.map(({ m }) => agentCost(m))),
+    unitsWallMs: sum(withModel.map(({ m }) => (isNum(m.wallMs) ? m.wallMs : 0))),
+    agentWallMs: nullableSum(withModel.map(({ m }) => agentWall(m))),
+    models: uniq(withModel.map(({ m }) => m.model)),
+    judgeModels: uniq(withModel.map(({ m }) => m.judgeModel ?? null)),
+    votes: uniq(
+      withModel.flatMap(({ m }) => [m.unitsScore?.votes, m.agentScore?.votes].filter(isNum) as number[]),
+    ).sort((a, b) => a - b),
+  };
+}
+
+/**
+ * One parsed file → its index entry, or `null` when it is not a unit-survey
+ * report (a stray JSON file, or a shape this version cannot read). A torn,
+ * half-written file never gets this far — the scan's `JSON.parse` drops it.
+ */
+export function summariseUnitSurveyReport(id: string, raw: unknown, fallbackIso: string): UnitSurveyEntry | null {
+  const r = raw as Partial<ReplayReport> | null;
+  if (!r || typeof r !== "object" || typeof r.label !== "string" || !Array.isArray(r.cases)) return null;
+  const cases = r.cases.filter((c): c is ReplayCase => !!c && typeof c === "object" && typeof c.instanceId === "string");
+  const ok = cases.filter((c) => !c.error);
+  const tallies = ok.map((c) => c.coverageTally).filter((t) => t && typeof t === "object");
+  const shapes = ok.map((c) => c.shape).filter((s) => s && typeof s === "object");
+  const model = modelTotals(cases);
+  return {
+    id,
+    report: `/data/${UNIT_SURVEY_DIR}/${encodeURIComponent(`${id}.json`)}`,
+    generatedAt: (typeof r.startedAt === "string" && r.startedAt) || parseUnitSurveyStamp(id) || fallbackIso,
+    finishedAt: typeof r.finishedAt === "string" ? r.finishedAt : null,
+    status: r.status === "running" || r.status === "failed" ? r.status : "done",
+    heartbeat: typeof r.heartbeat === "string" ? r.heartbeat : null,
+    planned: Array.isArray(r.planned) ? r.planned.length : null,
+    error: typeof r.error === "string" ? r.error : null,
+    label: r.label,
+    stage: model || r.stage === "replay" ? "replay" : "coverage",
+    cases: cases.length,
+    errored: cases.length - ok.length,
+    arms: [...new Set(cases.map(armOf))].sort(),
+    promptVersion: typeof r.codeFacts?.promptVersion === "string" ? r.codeFacts.promptVersion : null,
+    coverage: {
+      covered: sum(tallies.map((t) => t.covered ?? 0)),
+      locatable: sum(tallies.map((t) => t.locatable ?? 0)),
+      gold: sum(tallies.map((t) => t.gold ?? 0)),
+      unlocatable: sum(tallies.map((t) => t.unlocatable ?? 0)),
+    },
+    units: sum(shapes.map((s) => s.units ?? 0)),
+    requestChars: sum(shapes.map((s) => s.requestChars ?? 0)),
+    truncated: sum(shapes.map((s) => s.truncated ?? 0)),
+    model,
+  };
+}
+
+// ── the detail view ─────────────────────────────────────────────────────────
+
+/** A gold that exactly one side's judge credited, with the rows that did it. */
+export interface OneSidedGold {
+  index: number;
+  gold: MicroGoldRef | undefined;
+  side: "units" | "agent";
+  /** The crediting side's row ids at this gold (`cells[j].rows`). */
+  rows: string[];
+  /** How many judge passes credited it, when the report kept the tally. */
+  creditVotes: number | null;
+  votes: number | null;
+}
+
+/** Every gold one side credited and the other did not, units first. */
+export function oneSidedGold(c: ReplayCase): OneSidedGold[] {
+  const m = okModel(c);
+  if (!m) return [];
+  const pick = (side: "units" | "agent", idx: number[] | undefined): OneSidedGold[] => {
+    const score = side === "units" ? m.unitsScore : m.agentScore;
+    return (idx ?? []).map((j) => ({
+      index: j,
+      gold: c.gold?.[j],
+      side,
+      rows: score?.cells?.[j]?.rows ?? [],
+      creditVotes: isNum(score?.creditVotes?.[j]) ? score!.creditVotes![j] : null,
+      votes: isNum(score?.votes) ? score!.votes! : null,
+    }));
+  };
+  return [...pick("units", m.sides?.onlyUnits), ...pick("agent", m.sides?.onlyAgent)];
+}
+
+/** `1/4` + a percent, or `n/a` — a fraction never loses its denominator. */
+export function fmtGoldFraction(n: number | null | undefined, of: number): string {
+  if (!isNum(n)) return "n/a";
+  return of > 0 ? `${n}/${of} (${Math.round((100 * n) / of)}%)` : `${n}/0`;
+}

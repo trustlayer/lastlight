@@ -22,12 +22,7 @@ import {
   renderDischargeLedger,
 } from "./discharge.js";
 import { EXIT_DEGRADED, EXIT_UNAVAILABLE, EXIT_OK } from "./errors.js";
-import {
-  buildFindingsLedger,
-  checkFindings,
-  renderFindingsCheck,
-  renderFindingsLedger,
-} from "./findings.js";
+import { checkFindings, renderFindingsCheck } from "./findings.js";
 import { renderStampSeverity, stampDerivedSeverity } from "./finding-severity.js";
 import { normalizeFamilyIds } from "./hypotheses.js";
 import { prepareTree } from "./prepare.js";
@@ -47,13 +42,25 @@ import {
   type MintOptions,
   type SeedFamily,
 } from "./seed.js";
-import { buildEntries, renderAdjudicationDossier } from "./adjudicate-render.js";
-import { classifyHypotheses, writeJevClassifyDocument, jevClassifyPath } from "./jev-classify.js";
-import { renderFamilyBlock } from "./seed-render.js";
+import { buildUnitsOrEmpty, emptyUnitsDocument } from "./units.js";
+import { ingestUnits, renderIngest } from "./units-ingest.js";
+import { renderProbePlanSummary, writeProbePlan } from "./probe-plan.js";
 import { loadManifest, resolveFactsBin, toolchainStamp } from "./toolchain.js";
 import { compilerInfo } from "./project.js";
+import {
+  checkSelection,
+  checkSiteSlot,
+  finalizeSiteFindings,
+  renderFinalize,
+  renderSelectionCheck,
+  renderSiteCheck,
+  renderSiteMerge,
+  renderSitePlanSummary,
+  writeSiteMerge,
+  writeSitePlan,
+} from "./site-review.js";
 import { packageRoot } from "./toolchain.js";
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { LoggerPort } from "./log.js";
 
@@ -80,18 +87,30 @@ Commands:
               label kept as \`declared_id\`). \`--ungraded\` for a family whose
               obligations are not on disk (\`spec\`): the id rewrite plus a
               non-empty-file check
+  probe-plan  decide WHICH hypotheses \`falsify\` probes: the gate's owed set
+              (derived Critical, or a survey's own \`needsProbe\`), ranked and
+              capped, written to probes/plan.json + the records falsify reads,
+              probes/plan.md. The \`probes\` gate then owes exactly that list
   probes      the \`falsify\` loop's exit gate — every hypothesis that needed a
               probe has a verdict, and every claim of execution has a transcript
               that OPENS with the command it ran
-  findings    the \`adjudicate\` loop's exit gate — the CONSERVATION check: every
-              hypothesis has exactly one disposition, and every deletion names a
-              transcript that exists
-  dossier     the \`adjudicate\` phase's INPUT — every hypothesis, probe verdict,
-              transcript and conservation row joined into one document, with
-              every quote already checked against the tree
-  jev-classify  #399 idea 2 — one TypeSafe System-One call PER HYPOTHESIS
-              asking the category axis, written for \`dossier\` to render as an
-              ADVISORY annotation. Never decides; never fails the run.
+  findings    the CONSERVATION floor (\`--repair\`): every hypothesis findings.json
+              does not account for is recorded at tier "internal", and every
+              hypothesis-derived finding's severity is derived
+  units       cut the PR into units (one per changed function/method, at most
+              one per file for its module-scope regions, one \`pr\` unit for
+              obligations no unit holds) and render each unit's COMPLETE model request into
+              units.json — the input to the in-process unit survey
+  units-ingest  validate each units/responses/<unitId>.json and write the
+              replies as hypotheses/<family>.jsonl rows (the shape every later
+              phase already reads), plus units/ingest.json. Every obligation
+              gets a row even when its unit failed — with unknown evidence
+  sites       the \`sites\` review engine's deterministic steps: --plan (rank
+              sites, write one brief per slot; --top <n> sites, --pair for a
+              second investigator per site in slot 8+rank, --slots <n> the
+              fan-out's branch count), --check <site-id> (a site
+              investigator's gate), --merge (pool the findings for \`select\`),
+              --check-select (select's gate), --finalize (write findings.json)
   toolchain   print the pinned manifest and what actually resolved
 
 \`discharge\` options (WP3 — it replaces \`test -s\`, which one line of any content
@@ -107,6 +126,52 @@ passes; it reads no quote and judges no claim):
   something is outstanding. 2 = there was nothing to grade — no
   hypotheses/<family>.jsonl at all, no readable obligations.json, or a --family
   the document does not name. ANY non-zero means "iterate again".
+
+\`units\` options (it reads the pipeline's own artifacts plus git; no --base/--head):
+  --dir <dir>         the .lastlight/pr-review directory
+                      (default: .lastlight/pr-review)
+  --repo <dir>        the checkout whose git objects are read   (default: cwd)
+  --facts <file>      the \`all\` document            (default: <dir>/facts.json)
+  --obligations <f>   the seeder's document   (default: <dir>/obligations.json).
+                      Absent ⇒ units carry no obligations, named in degraded[]
+  --spec <file>       core's spec obligations (default: <dir>/spec-obligations.json).
+                      Each rides on the unit with the most touched lines in its
+                      first candidate file that has one, else the \`pr\` unit.
+                      Absent or malformed ⇒ no spec obligation, named in degraded[]
+  --out <file>        where units.json goes      (default: <dir>/units.json)
+  --max-chars <n>     per-request budget in characters (default 100000). Over it:
+                      trim neighbours, then drop them, then split the unit into
+                      overlapping passes — each step marks the unit \`truncated\`
+                      and names itself in degraded[]
+  --max-units <n>     units per document, i.e. model calls (default 150). Past
+                      it the lowest-priority units are dropped — named in
+                      degraded[], their obligations moved to the \`pr\` unit
+  --family-split-lines <n>
+                      a unit owning more changed lines than this (default 40)
+                      is surveyed once PER FAMILY — one unit per asked family,
+                      each carrying only that family's obligations
+  --never-fail        exit 0 whatever happened; the document says what did
+  Exit 0 = full, or nothing to survey (\`coverage: "none"\`, said why). 3 =
+  degraded. 2 = an input is missing — a \`coverage: "none"\` document is still
+  written, naming it.
+
+\`units-ingest\` options:
+  --dir <dir>         the .lastlight/pr-review directory
+                      (default: .lastlight/pr-review)
+  --never-fail        exit 0 whatever happened; units/ingest.json says what did
+  Exit 0 = every unit answered and every family's \`discharge\` gate passes on
+  the ingested rows. 3 = something was unanswered (its rows still written). 2 =
+  units.json unreadable (rows still written for every obligation).
+
+\`probe-plan\` options:
+  --dir <dir>         the .lastlight/pr-review directory
+                      (default: .lastlight/pr-review)
+  --max-probes <n>    select at most this many (default: no cap). The rest are
+                      recorded as deferred and reach adjudication unprobed
+  --never-fail        exit 0 whatever happened. Without a plan file every reader
+                      falls back to the pre-plan owed set, so a failure here
+                      costs the cap, never a probe
+  Exit 0 = plan written. 2 = it could not be written.
 
 \`probes\` options (a near-existence gate, not a validator — it reads a
 transcript's FIRST LINE and nothing else):
@@ -135,39 +200,7 @@ transcript's FIRST LINE and nothing else):
                       DERIVES every hypothesis-derived finding's severity from
                       the evidence record and probe strength, keeping the
                       written value as \`declaredSeverity\`.
-  --ledger            print the CHECKLIST instead of grading: every declared id
-                      by family, which already carry a disposition, and which do
-                      not. For the ADJUDICATOR to run, so it discharges an
-                      explicit list rather than reconstructing one from six
-                      .jsonl files. Reports; never grades — ALWAYS exits 0.
-  Exit 0 = the loop may stop. Non-zero = a hypothesis is unaccounted for, a
-  deletion has nothing to show for it, or there is no readable findings.json.
-
-\`dossier\` options (it reads the pipeline's own artifacts; no --base/--head):
-  --dir <dir>         the .lastlight/pr-review directory
-                      (default: .lastlight/pr-review)
-  --repo <dir>        what a quote path and a transcript path are relative to
-                      (default: cwd)
-  --out <file>        write the dossier here                   (default: stdout)
-  --transcript-chars <n>  cap on an inlined probe transcript   (default: 4000).
-                      Truncation is always announced with the path.
-  --json              the structured rows behind the Markdown, keyed by
-                      hypothesis id — for a consumer that reads one row per
-                      hypothesis rather than a document meant for a model
-  Always exits 0. Its consumer is the harness, which attaches the result to the
-  phase — a missing artifact is a thinner dossier that SAYS so, never a failure
-  that strands the phase with nothing.
-
-\`jev-classify\` options (annotates the dossier; decides nothing):
-  --dir <dir>         the .lastlight/pr-review directory
-                      (default: .lastlight/pr-review)
-  --repo <dir>        what a quote path is relative to        (default: cwd)
-  --model <id>        the TypeSafe model                (default: jev-latest)
-  --concurrency <n>   parallel systemOne calls                     (default: 8)
-  --out <file>        write jev.json here    (default: .lastlight/pr-review/jev.json)
-  Needs TYPESAFE_KEY (or TYPESAFE_API_KEY). Always exits 0 — a missing key, a
-  network error, or a malformed answer writes a document that SAYS so (an
-  \`error\`, per hypothesis or for the whole run) rather than failing the phase.
+  \`--repair\` is required: the grading gate went with the adjudicator it gated.
 
 \`prepare\` options (it acts on a tree; no --base/--head, and it runs no analysis):
   --repo <dir>        the checkout to prepare               (default: cwd)
@@ -187,7 +220,6 @@ transcript's FIRST LINE and nothing else):
 \`seed\` options (it reads a DOCUMENT, not a repo — no --base/--head):
   --facts <file>      the \`all\` document to seed from            (required)
   --out <file>        write obligations.json here                (default: stdout)
-  --blocks <dir>      also write one rendered block per family, \`<family>.md\`
   --max-obligations <n>  TOTAL backstop (default 48). Truncation is per-FAMILY
                       first — contract 12, enforcement 12, state 8, security 8,
                       tests 8 — because each family feeds one survey branch, so
@@ -287,10 +319,16 @@ const BOOLEAN_FLAGS = new Set([
   "typecheck",
   "coverage",
   "repair",
-  // Both `findings --ledger` and `discharge --ledger` take no value. Declaring
-  // it keeps `--ledger` from swallowing the next token as one.
+  // `discharge --ledger` takes no value. Declaring it keeps `--ledger` from
+  // swallowing the next token as one.
   "ledger",
   "ungraded",
+  // `sites`' mode switches. `--check` is the one that takes a value (the slot id).
+  "plan",
+  "pair",
+  "merge",
+  "finalize",
+  "check-select",
 ]);
 
 export function parseArgv(argv: string[]): Parsed {
@@ -349,19 +387,11 @@ function selfVersion(): string {
  * `process.exit`, so a test can assert the §D12 contract — that `--never-fail`
  * returns 0 on a repo that cannot be analysed — without spawning.
  */
-/**
- * Every command here is synchronous and deterministic — the whole design
- * point of a "deterministic layer" — except `jev-classify`, the one command
- * that calls a third-party API. Rather than make every command async for one
- * that needs it, the return type widens to admit a `Promise<number>` ONLY
- * from that branch; every other command still returns a plain `number`
- * immediately, so no existing synchronous caller changes behaviour.
- */
 export function runCli(
   argv: string[],
   io: { out: (s: string) => void; err: (s: string) => void },
   log?: LoggerPort,
-): number | Promise<number> {
+): number {
   const { command, flags } = parseArgv(argv);
 
   if (flags.version === true || flags.v === true) {
@@ -474,6 +504,121 @@ export function runCli(
     return dischargeExitCode(result);
   }
 
+  if (command === "units") {
+    // A deterministic phase like `facts` and `seed`, so the same §D12 contract:
+    // a missing input still writes a document that SAYS so, and `--never-fail`
+    // turns every outcome into exit 0.
+    const neverFail = flags["never-fail"] === true;
+    const dir = stringFlag(flags.dir) ?? ".lastlight/pr-review";
+    const out = stringFlag(flags.out) ?? join(dir, "units.json");
+    try {
+      const result = buildUnitsOrEmpty({
+        dir,
+        repo: stringFlag(flags.repo) ?? process.cwd(),
+        factsPath: stringFlag(flags.facts),
+        obligationsPath: stringFlag(flags.obligations),
+        specPath: stringFlag(flags.spec),
+        maxRequestChars: numberFlag(flags["max-chars"]),
+        maxUnits: numberFlag(flags["max-units"]),
+        familySplitLines: numberFlag(flags["family-split-lines"]),
+        log,
+      });
+      writeDocument(out, result.document);
+      const doc = result.document;
+      io.out(
+        `units: ${doc.units.length} unit(s), coverage ${doc.coverage}, ${doc.units.filter((u) => u.truncated).length} truncated → ${out}` +
+          doc.degraded.map((d) => `\n  degraded: ${d.reason}`).join(""),
+      );
+      return neverFail ? EXIT_OK : result.exitCode;
+    } catch (err) {
+      if (!neverFail) throw err;
+      const reason = `units failed: ${err instanceof Error ? err.message : String(err)}`;
+      try {
+        writeDocument(out, emptyUnitsDocument(reason));
+      } catch {
+        // Nothing left to write with; the log line is the record.
+      }
+      io.err(reason);
+      return EXIT_OK;
+    }
+  }
+
+  if (command === "units-ingest") {
+    const neverFail = flags["never-fail"] === true;
+    try {
+      const result = ingestUnits({ dir: stringFlag(flags.dir) ?? ".lastlight/pr-review", log });
+      io.out(renderIngest(result.document));
+      return neverFail ? EXIT_OK : result.exitCode;
+    } catch (err) {
+      if (!neverFail) throw err;
+      io.err(`units-ingest failed: ${err instanceof Error ? err.message : String(err)}`);
+      return EXIT_OK;
+    }
+  }
+
+  if (command === "sites") {
+    const dir = stringFlag(flags.dir) ?? ".lastlight/pr-review";
+    const repo = stringFlag(flags.repo) ?? ".";
+    const neverFail = flags["never-fail"] === true;
+    // The two GATES (`--check`, `--check-select`) are loop conditions, like
+    // `probes` and `findings`: non-zero means "iterate again", so they are not
+    // wrapped by `--never-fail`. The three steps are inputs, never gates, and
+    // `--never-fail` keeps a crash in one from failing the phase.
+    const check = stringFlag(flags.check);
+    if (check) {
+      const result = checkSiteSlot({ dir, repo, siteId: check });
+      io.out(renderSiteCheck(check, result));
+      return result.satisfied ? EXIT_OK : EXIT_DEGRADED;
+    }
+    if (flags["check-select"] === true) {
+      const result = checkSelection({ dir });
+      io.out(renderSelectionCheck(result));
+      return result.satisfied ? EXIT_OK : EXIT_DEGRADED;
+    }
+    try {
+      if (flags.plan === true) {
+        io.out(
+          renderSitePlanSummary(
+            writeSitePlan(dir, {
+              ...(numberFlag(flags.top) !== undefined ? { top: numberFlag(flags.top) } : {}),
+              ...(numberFlag(flags.window) !== undefined ? { window: numberFlag(flags.window) } : {}),
+              ...(numberFlag(flags.slots) !== undefined ? { slots: numberFlag(flags.slots) } : {}),
+              ...(flags.pair === true ? { pair: true } : {}),
+            }),
+          ),
+        );
+        return EXIT_OK;
+      }
+      if (flags.merge === true) {
+        io.out(renderSiteMerge(writeSiteMerge(dir, repo)));
+        return EXIT_OK;
+      }
+      if (flags.finalize === true) {
+        io.out(renderFinalize(finalizeSiteFindings({ dir, repo })));
+        return EXIT_OK;
+      }
+    } catch (err) {
+      io.err(`sites failed: ${err instanceof Error ? err.message : String(err)}`);
+      return neverFail ? EXIT_OK : EXIT_UNAVAILABLE;
+    }
+    io.err("sites: pass one of --plan, --check <site-id>, --merge, --check-select, --finalize");
+    return EXIT_UNAVAILABLE;
+  }
+
+  if (command === "probe-plan") {
+    const neverFail = flags["never-fail"] === true;
+    try {
+      const { plan } = writeProbePlan(stringFlag(flags.dir) ?? ".lastlight/pr-review", {
+        maxProbes: numberFlag(flags["max-probes"]) ?? null,
+      });
+      io.out(renderProbePlanSummary(plan));
+      return EXIT_OK;
+    } catch (err) {
+      io.err(`probe-plan failed: ${err instanceof Error ? err.message : String(err)}`);
+      return neverFail ? EXIT_OK : EXIT_UNAVAILABLE;
+    }
+  }
+
   if (command === "probes") {
     // The `falsify` loop's `until_bash`. NOT wrapped by `--never-fail`: its
     // non-zero exit is the loop condition, not a failure — the phase around it
@@ -490,93 +635,24 @@ export function runCli(
   if (command === "findings") {
     const dir = stringFlag(flags.dir) ?? ".lastlight/pr-review";
 
-    // `--ledger` is the CHECKLIST mode, and its caller is the ADJUDICATOR
-    // ITSELF rather than the harness — so it **always exits 0**. The two other
-    // modes below are a loop condition, where non-zero means "iterate again";
-    // an agent running that inside its own bash tool would read the same exit
-    // as a tool failure. Same reading of the same files, two audiences, two
-    // exit contracts, and conflating them is how the checklist would come to
-    // be treated as the gate.
-    if (flags.ledger === true) {
-      io.out(
-        renderFindingsLedger(
-          buildFindingsLedger({ dir, repo: stringFlag(flags.repo), log }),
-        ),
-      );
-      return EXIT_OK;
+    // Only the §D12 floor (`reconcile`) is left: the grading mode was the
+    // adjudicate loop's `until_bash`, and went with it.
+    if (flags.repair !== true) {
+      io.err("findings: pass --repair — the grading gate was removed with the adjudicator");
+      return EXIT_UNAVAILABLE;
     }
-
-    // The `adjudicate` loop's `until_bash`, and the same contract as `probes`:
-    // its non-zero exit is the LOOP condition, not a failure, so it is not
-    // wrapped by `--never-fail`. `--repair` is the §D12 floor — it always
-    // returns 0, because a floor that can fail is not a floor.
     const result = checkFindings({
-      dir: stringFlag(flags.dir) ?? ".lastlight/pr-review",
+      dir,
       repo: stringFlag(flags.repo),
-      repair: flags.repair === true,
+      repair: true,
       log,
     });
     io.out(renderFindingsCheck(result));
-    // Issue #405: the floor is also where a finding's severity is DERIVED —
-    // after `adjudicate`, so the adjudicator's own value cannot stand on a
-    // hypothesis-derived finding. Never fails the floor: an unreadable
-    // document is reported and left as it is.
-    if (flags.repair === true) {
-      io.out(renderStampSeverity(stampDerivedSeverity({ dir, repo: stringFlag(flags.repo), log })));
-    }
+    // Issue #405: the floor is also where a finding's severity is DERIVED.
+    // Never fails the floor: an unreadable document is reported and left as
+    // it is.
+    io.out(renderStampSeverity(stampDerivedSeverity({ dir, repo: stringFlag(flags.repo), log })));
     return result.satisfied ? EXIT_OK : EXIT_DEGRADED;
-  }
-
-  if (command === "dossier") {
-    // Always exits 0, and for the same reason `findings --ledger` does: this is
-    // not a gate. It renders what exists. A run whose surveys wrote nothing
-    // gets a dossier that says so in a labelled block — which is strictly more
-    // than the phase had before — and a non-zero exit here would strand
-    // `adjudicate` with no input at all rather than with a thin one.
-    const dossierOptions = {
-      dir: stringFlag(flags.dir) ?? ".lastlight/pr-review",
-      repo: stringFlag(flags.repo),
-      transcriptChars: numberFlag(flags["transcript-chars"]),
-    };
-    // `--json` hands back the STRUCTURED rows `buildEntries` already computed
-    // for the rendered Markdown — same excerpt resolution, same probe join,
-    // same ids — for a consumer that wants to key off `record.id` rather than
-    // re-parse prose. First consumer: the per-hypothesis System-1 probe (#399
-    // idea 2), which needs one row per hypothesis, not a document meant to be
-    // read top to bottom by a model.
-    const text =
-      flags.json === true
-        ? JSON.stringify(buildEntries(dossierOptions), null, 2)
-        : renderAdjudicationDossier(dossierOptions);
-    const out = stringFlag(flags.out);
-    if (out) writeDocument(out, text, { raw: true });
-    else io.out(text);
-    return EXIT_OK;
-  }
-
-  if (command === "jev-classify") {
-    // The one async, network-calling command in this CLI — see `runCli`'s own
-    // doc comment. Always exits 0: a missing key, a network error, or a
-    // malformed answer writes a document that SAYS so (`error`, whole-run or
-    // per-hypothesis) rather than failing the phase — see `jev-classify.ts`.
-    const dir = stringFlag(flags.dir) ?? ".lastlight/pr-review";
-    return classifyHypotheses({
-      dir,
-      repo: stringFlag(flags.repo),
-      model: stringFlag(flags.model),
-      concurrency: numberFlag(flags.concurrency),
-      log,
-    }).then((doc) => {
-      const outFlag = stringFlag(flags.out);
-      if (outFlag) writeDocument(outFlag, JSON.stringify(doc, null, 2), { raw: true });
-      else writeJevClassifyDocument(dir, doc);
-      io.out(
-        doc.error
-          ? `jev-classify: ${doc.error} — wrote an empty annotation set`
-          : `jev-classify: classified ${doc.results.length} hypothesis(es) with ${doc.model} → ${outFlag ?? jevClassifyPath(dir)}`,
-      );
-      return EXIT_OK;
-    });
   }
 
   if (command === "seed") {
@@ -700,26 +776,6 @@ export function runCli(
       log,
     });
 
-    const blocksDir = stringFlag(flags.blocks);
-    if (blocksDir) {
-      for (const family of SEEDABLE_FAMILIES) {
-        // `stagedDiff` rides the FACTS envelope, not the obligations document —
-        // the seeder reads it and does not own it — so it is threaded here
-        // rather than stamped. Passing `undefined` when the field is absent is
-        // load-bearing: the brief says "nobody staged" in different words from
-        // "staging failed", and both out loud.
-        const block = renderFamilyBlock(
-          obligations,
-          family,
-          document.stagedDiff,
-        );
-        // An empty block means "nothing to say AND nothing degraded". Writing an
-        // empty file would make a phase's `test -s` gate pass on silence.
-        if (block)
-          writeDocument(join(blocksDir, `${family}.md`), block, { raw: true });
-      }
-    }
-
     const seedOut = stringFlag(flags.out);
     if (seedOut) writeDocument(seedOut, obligations);
     else io.out(JSON.stringify(obligations, null, 2));
@@ -732,7 +788,7 @@ export function runCli(
 
   if (!EXTRACTORS.includes(command as ExtractorName)) {
     io.err(
-      `unknown command "${command}". One of: ${EXTRACTORS.join(", ")}, seed, prepare, discharge, probes, findings, toolchain`,
+      `unknown command "${command}". One of: ${EXTRACTORS.join(", ")}, seed, prepare, discharge, probe-plan, probes, findings, units, units-ingest, toolchain`,
     );
     return EXIT_UNAVAILABLE;
   }
@@ -789,10 +845,7 @@ if (isMain) {
   void (async () => {
     let code: number;
     try {
-      // Every command but `jev-classify` returns a plain `number`
-      // immediately; `await` on one is a no-op, so this costs nothing on the
-      // synchronous, deterministic path.
-      code = await runCli(process.argv.slice(2), {
+      code = runCli(process.argv.slice(2), {
         out: (s) => process.stdout.write(`${s}\n`),
         err: (s) => process.stderr.write(`${s}\n`),
       });

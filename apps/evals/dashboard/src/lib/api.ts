@@ -1,7 +1,21 @@
-import { useQueries, useQuery } from "@tanstack/react-query";
+import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { microStatus, withMicroEntryDefaults } from "../../../src/micro-survey.js";
-import type { DashboardIndex, MicroSurveyIndex, MicroSurveyReport, Scorecard } from "../types";
+import { unitSurveyStatus } from "../../../src/unit-survey-index.js";
+import { phaseReplayStatus } from "../../../src/phase-replay.js";
+import type {
+  DashboardIndex,
+  FindingLabel,
+  FindingsResponse,
+  LabelInput,
+  MicroSurveyIndex,
+  MicroSurveyReport,
+  PhaseReplayIndex,
+  PhaseReplayReport,
+  ReplayReport,
+  Scorecard,
+  UnitSurveyIndex,
+} from "../types";
 import {
   buildFamilyDrilldown,
   type FamilyDrilldown,
@@ -93,6 +107,126 @@ export function useMicroReport(url: string | undefined, live = false) {
     refetchInterval: live ? 1500 : false,
     staleTime: live ? 0 : Infinity,
     placeholderData: (prev) => prev,
+  });
+}
+
+/**
+ * The unit-survey replay index (`/api/unit-survey`). A 404 is an EMPTY list,
+ * for the same reason as {@link useMicroIndex}: a server or baked site that
+ * predates the endpoint has no replays to show, and that is not an error.
+ *
+ * `scripts/unit-survey-replay.ts` writes its report at START and after every
+ * case (plus a 15 s heartbeat), so a replay in flight is listed with progress.
+ * The list polls at the live cadence while any report is genuinely running
+ * ({@link unitSurveyStatus} — the index's own derivation) and at the slow
+ * heartbeat otherwise. App mounts this on every route, so the home page's
+ * merged list refreshes at the same cadence.
+ */
+export const unitSurveyActive = (idx?: UnitSurveyIndex, now = Date.now()): boolean =>
+  !!idx?.reports.some((r) => unitSurveyStatus(r, now) === "running");
+
+export function useUnitSurveyIndex() {
+  return useQuery({
+    queryKey: ["unit-survey-index"],
+    queryFn: async (): Promise<UnitSurveyIndex> => {
+      const res = await fetch("/api/unit-survey", { headers: { accept: "application/json" } });
+      if (res.status === 404) return { generatedAt: new Date().toISOString(), reports: [] };
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText} — /api/unit-survey`);
+      const idx = (await res.json()) as UnitSurveyIndex;
+      return { ...idx, reports: idx.reports ?? [] };
+    },
+    refetchInterval: (q) => (unitSurveyActive(q.state.data) ? 1500 : 15000),
+  });
+}
+
+/**
+ * One unit-survey report in full. A RUNNING report is rewritten after every
+ * case, so it is re-fetched at the live cadence and never served from cache; a
+ * settled one never changes again and is cached for good. `live` is in the key
+ * so running→done forces one last fetch of the final write, with the previous
+ * data held on screen meanwhile (as {@link useMicroReport}).
+ */
+export function useUnitSurveyReport(url: string | undefined, live = false) {
+  return useQuery({
+    queryKey: ["unit-survey-report", url, live],
+    queryFn: () => getJson<ReplayReport>(url as string),
+    enabled: !!url,
+    refetchInterval: live ? 1500 : false,
+    staleTime: live ? 0 : Infinity,
+    placeholderData: (prev) => prev,
+  });
+}
+
+/**
+ * The phase-replay index (`/api/phase-replay`) — micro-falsify and
+ * micro-adjudicate reports. Same contract as {@link useUnitSurveyIndex}: a 404
+ * is an empty list, and it polls at the live cadence while any report is
+ * genuinely running (the scripts write after every case plus a 15 s heartbeat).
+ */
+export const phaseReplayActive = (idx?: PhaseReplayIndex, now = Date.now()): boolean =>
+  !!idx?.reports.some((r) => phaseReplayStatus(r, now) === "running");
+
+export function usePhaseReplayIndex() {
+  return useQuery({
+    queryKey: ["phase-replay-index"],
+    queryFn: async (): Promise<PhaseReplayIndex> => {
+      const res = await fetch("/api/phase-replay", { headers: { accept: "application/json" } });
+      if (res.status === 404) return { generatedAt: new Date().toISOString(), reports: [] };
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText} — /api/phase-replay`);
+      const idx = (await res.json()) as PhaseReplayIndex;
+      return { ...idx, reports: idx.reports ?? [] };
+    },
+    refetchInterval: (q) => (phaseReplayActive(q.state.data) ? 1500 : 15000),
+  });
+}
+
+/** One phase-replay report in full; live while running, cached once settled. */
+export function usePhaseReplayReport(url: string | undefined, live = false) {
+  return useQuery({
+    queryKey: ["phase-replay-report", url, live],
+    queryFn: () => getJson<PhaseReplayReport>(url as string),
+    enabled: !!url,
+    refetchInterval: live ? 1500 : false,
+    staleTime: live ? 0 : Infinity,
+    placeholderData: (prev) => prev,
+  });
+}
+
+/**
+ * Every flagged finding + its human label (`/api/findings`). A scan over the
+ * reports and fixtures, so it polls slowly; a saved label patches the cache in
+ * place rather than refetching the whole list under the grader's cursor.
+ */
+export function useFindings(enabled = true) {
+  return useQuery({
+    queryKey: ["findings"],
+    queryFn: () => getJson<FindingsResponse>("/api/findings"),
+    enabled,
+    refetchInterval: 60000,
+    refetchOnWindowFocus: false,
+  });
+}
+
+export function useSaveLabel() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (input: LabelInput): Promise<FindingLabel> => {
+      const res = await fetch("/api/labels", {
+        method: "POST",
+        headers: { "content-type": "application/json", accept: "application/json" },
+        body: JSON.stringify(input),
+      });
+      const body = (await res.json().catch(() => ({}))) as FindingLabel & { error?: string };
+      if (!res.ok) throw new Error(body.error ?? `${res.status} ${res.statusText}`);
+      return body;
+    },
+    onSuccess: (label) =>
+      qc.setQueryData<FindingsResponse>(["findings"], (prev) =>
+        prev && {
+          ...prev,
+          findings: prev.findings.map((f) => (f.key === label.key ? { ...f, label: label.real === null ? null : label } : f)),
+        },
+      ),
   });
 }
 

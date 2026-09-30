@@ -25,6 +25,8 @@
  * mock, no sandbox, no harness.
  */
 
+import { renderPriorDiscussion } from "./pr-discussion.js";
+import { renderPrIntent } from "./pr-intent.js";
 import type { DependenciesConfig, FixConfig, ReviewConfig } from "../config/config.js";
 import type { PrState } from "./pr-state.js";
 import { renderCiFailureReport } from "./github/github.js";
@@ -33,7 +35,7 @@ import { HOLD_LABEL } from "../cron/dependabot-discovery.js";
 import { ATTEMPT_FREE_CLASSES } from "./fix-markers.js";
 import { renderPrNotes } from "./pr-notes.js";
 import { PR_NOTES_FILE_NAME, VERIFY_SCRIPT_NAME } from "./fix-scratch.js";
-import { buildSpecObligations, renderLinkedIssues, renderSpecObligations } from "./review-spec.js";
+import { buildSpecObligations, type SpecObligationSet } from "./review-spec.js";
 
 /**
  * A skip that must be ESCALATED on the pull request — labelled `requires-human`
@@ -96,7 +98,14 @@ export interface Decision<T> {
    * and `check-prs-awaiting-review`. A future phase must convert
    * drop-on-lock into queue-on-lock before removing any of them.
    */
-  runInFlight?: { workflow: string; runId: string };
+  runInFlight?: { workflow: string; runId: string; headSha?: string | null };
+  /**
+   * Set ONLY on a `pr-review` dispatch that REPLACES an in-flight review of an
+   * older head (see `resolveReviewTrigger`). The gate cancels that run and
+   * waits for it to stop before this one provisions the shared workspace
+   * (`./supersede.ts`). Typed for the same reason as {@link runInFlight}.
+   */
+  supersedes?: { workflow: string; runId: string };
   /**
    * Set ONLY on the `budget-exhausted` skip of {@link resolveBuildTrigger} —
    * the autonomy pipeline's daily spend ceiling, harness-wide or per-repo.
@@ -830,6 +839,24 @@ export interface ReviewTriggerOptions {
    * new commit exists, so no further `check_suite` will ever fire for them.
    */
   route?: "attention" | "checks-settled" | "sweep";
+  /** The clock, for the sweep's pending grace window. Defaults to now. */
+  now?: Date;
+}
+
+/**
+ * Has the head's CI been pending for at least the sweep's grace window?
+ *
+ * `true` when the pending start cannot be dated, or the window is `0` — both
+ * restore the sweep's old "dispatch on pending" behaviour, which is the safe
+ * direction for a release valve (a PR reviewed early costs timing; a PR never
+ * reviewed costs correctness).
+ */
+export function pendingOutlastedGrace(state: PrState, cfg: ReviewConfig, now: Date): boolean {
+  const graceMs = Math.max(0, cfg.sweepPendingGraceMinutes ?? 0) * 60_000;
+  if (graceMs === 0 || !state.checksPendingSince) return true;
+  const since = Date.parse(state.checksPendingSince);
+  if (!Number.isFinite(since)) return true;
+  return now.getTime() - since >= graceMs;
 }
 
 /**
@@ -860,6 +887,7 @@ export function resolveReviewTrigger(
     requestLabel: cfg.requestLabel,
     isDraft: state.isDraft,
     checksState: state.checksState,
+    checksPendingSince: state.checksPendingSince,
     botReviewAtHead: state.botReviewAtHead?.state ?? null,
     lastBotReviewSha: state.lastBotReview?.sha ?? null,
     assessedHeadSha: state.assessedHeadShaByWorkflow["pr-review"] ?? null,
@@ -906,7 +934,35 @@ export function resolveReviewTrigger(
   // `@bot review` does NOT override. The dispatcher replies to the human whose
   // request it dropped; the 30-minute sweep is the re-pickup.
   const locked = runLockDrop<ReviewTriggerDecision>("skip", state, inputs);
-  if (locked) return locked;
+  if (locked) {
+    // …except where the lock holder is itself a REVIEW of an older head. That
+    // review is stale the moment it lands, so a review this head is owed
+    // replaces it rather than waiting behind it (cancel-in-progress). Decided
+    // as though the lock were free: only a would-be `dispatch` supersedes — a
+    // new head whose CI is still pending defers as usual and leaves the old
+    // review running. A SAME-head holder is never superseded: an `@bot review`
+    // while the review of this very commit is mid-flight would throw that work
+    // away to redo it on identical input, so it keeps the lock (and its reply).
+    const holder = state.runInFlight;
+    if (
+      holder &&
+      holder.workflow === "pr-review" &&
+      holder.headSha &&
+      state.headSha &&
+      holder.headSha !== state.headSha
+    ) {
+      const fresh = resolveReviewTrigger({ ...state, runInFlight: null }, cfg, opts);
+      if (fresh.decision === "dispatch") {
+        return {
+          ...fresh,
+          reason: `supersede: ${holder.runId} is reviewing ${holder.headSha.slice(0, 7)}, the PR is now at ${state.headSha.slice(0, 7)} — ${fresh.reason}`,
+          inputs,
+          supersedes: { workflow: holder.workflow, runId: holder.runId },
+        };
+      }
+    }
+    return locked;
+  }
 
   const labelRequested = !!cfg.requestLabel && state.labels.includes(cfg.requestLabel);
   if (opts.explicitRequest || labelRequested) {
@@ -1088,8 +1144,25 @@ export function resolveReviewTrigger(
     // costs CORRECTNESS. `after-checks` is "on settle, either colour" — the
     // COLOUR was never the gate, and on the one route that exists precisely to
     // pick up what no webhook will ever fire for, neither is settling.
-    if (state.checksState === "pending" && route !== "sweep") {
-      return { decision: "defer", reason: "checks-pending: waiting for CI to settle", inputs };
+    //
+    // …but only once the pending state has outlasted
+    // `review.sweepPendingGraceMinutes`, dated from the oldest pending check.
+    // Without that the sweep could not tell "CI started two minutes ago" from
+    // "this check will never conclude" and reviewed mid-CI on the next :00/:30
+    // tick after every push (nearform/skillspro#2008). An undatable pending
+    // state still dispatches — see `pendingOutlastedGrace`.
+    if (
+      state.checksState === "pending" &&
+      (route !== "sweep" || !pendingOutlastedGrace(state, cfg, opts.now ?? new Date()))
+    ) {
+      return {
+        decision: "defer",
+        reason:
+          route === "sweep"
+            ? `checks-pending: CI pending since ${state.checksPendingSince}, inside the ${cfg.sweepPendingGraceMinutes}-minute sweep grace window`
+            : "checks-pending: waiting for CI to settle",
+        inputs,
+      };
     }
     if (route === "attention") {
       return {
@@ -1442,6 +1515,7 @@ export function resolveDispatchDisposition(
       // the same reason and one more — it is what stops the caller posting a
       // placeholder check against a head SHA we could not read.
       ...(review.runInFlight ? { runInFlight: review.runInFlight } : {}),
+      ...(review.supersedes ? { supersedes: review.supersedes } : {}),
       // Carried through the collapse for the same reason as the rest: the
       // caller keys on the typed field, and `decision: "skip"` alone cannot say
       // which skip it was.
@@ -1593,27 +1667,6 @@ export function renderContext(
 }
 
 /**
- * The `spec`-axis half of {@link renderContext} — the review evidence pipeline's
- * WP0 (`docs/plans/deterministic-pr-levers.md` §Decisions, D7).
- *
- * Returns `{}` unless `review.analysis.enabled`, and that empty object IS the
- * inertness guarantee (locked decision 8): with the axis off, the reviewing
- * agent's Context block is character-for-character the one it has always had.
- *
- * Three variables, and the first two are the plumbing §E2 found missing.
- * `prBody` is a declared `TemplateContext` field that nothing has ever
- * populated, and `closingIssuesReferences` existed on the client with
- * `repo-digest.ts` as its only consumer — so the reviewer has never once been
- * told what the change was FOR. That is the whole reason every candidate to
- * date could only ever have moved the standards axis.
- *
- * They are gated with the obligations rather than shipped unconditionally
- * because nothing else consumes them yet: an ungated `prBody` would change the
- * `pr-review` prompt on a deployment that has not opted into the pipeline, which
- * is precisely what locked decision 8 forbids. WP1+ can un-gate them the moment
- * a second consumer exists.
- */
-/**
  * The TRIAGE half of {@link renderContext} — what the `triage` phase of
  * `pr-review.yaml` gates on and renders (issue #378).
  *
@@ -1708,17 +1761,34 @@ function renderPathsSinceLastReview(paths: string[] | null): string {
     : shown.join("\n");
 }
 
+/**
+ * A {@link SpecObligationSet} as ONE line of JSON that no template guard can
+ * trip over — see `specObligationsJson` in {@link specContext}. Exported for the
+ * test that renders it through a real heredoc.
+ */
+export function specObligationsLine(set: SpecObligationSet): string {
+  return JSON.stringify(set).replace(/\{\{/g, "{\\u007b");
+}
+
+/**
+ * The review evidence pipeline's half of {@link renderContext}.
+ *
+ * Returns `{}` unless `review.analysis.enabled`, and that empty object IS the
+ * inertness guarantee (locked decision 8): with the pipeline off, the reviewing
+ * agent's Context block is character-for-character the one it has always had.
+ */
 function specContext(state: PrState, review?: ReviewConfig): Record<string, unknown> {
   if (!review?.analysis?.enabled) return {};
-  const rendered = renderSpecObligations(
-    buildSpecObligations({
-      prBody: state.body,
-      closes: state.closes,
-      changedFiles: state.changedFiles,
-      max: review.analysis.maxSpecObligations,
-    }),
-    review.analysis.obligationContract,
-  );
+  const specSet = buildSpecObligations({
+    prBody: state.body,
+    closes: state.closes,
+    changedFiles: state.changedFiles,
+    max: review.analysis.maxSpecObligations,
+  });
+  // Nothing to say AND nothing degraded writes no spec file; a degraded set
+  // still does, because "we could not look" and "we looked and it is fine"
+  // must stay distinguishable (locked decision 6).
+  const hasSpec = specSet.obligations.length > 0 || specSet.degraded.length > 0;
   return {
     /**
      * The ONE key WP3's phases gate on — `skip_if: "analysisEnabled != true"`.
@@ -1739,12 +1809,26 @@ function specContext(state: PrState, review?: ReviewConfig): Record<string, unkn
     /**
      * The `review` phase's install mode (issue #403), read as
      * `install: { from: reviewInstallPolicy, default: allow }`. With the
-     * pipeline on, `prepare` and `falsify` own execution and `review` is an
-     * abbreviated read, so an install there is blocked. Absent when the
+     * pipeline on, `review` runs only as a light re-review's focused read, so
+     * an install there is blocked. Absent when the
      * pipeline is off — the YAML default then keeps the `pr-review` skill's
      * install-to-probe affordance for the one review pass there is.
      */
     reviewInstallPolicy: "block",
+    /**
+     * What the author says the PR does, for the site investigators
+     * (`{{#if prIntent}}` in `review-site.md`): title, body and closed issues,
+     * bounded, template comments stripped (`renderPrIntent`). Empty — so the
+     * guard reads false — when the PR has none of the three.
+     */
+    prIntent: renderPrIntent({ title: state.title, body: state.body, closes: state.closes }),
+    /**
+     * The PR's prior conversation, for `select` (`{{#if priorDiscussion}}` in
+     * `review-select.md`): what was already raised, which threads the author
+     * resolved, the human review verdicts. Empty when the read failed or
+     * nobody has said anything (`renderPriorDiscussion`).
+     */
+    priorDiscussion: renderPriorDiscussion(state.discussion ?? null),
     /**
      * Phase budgets for `pr-review.yaml`'s deterministic `facts` / `seed` /
      * `reconcile` steps, read as `timeout_seconds: { from: … }` (issue #385).
@@ -1755,26 +1839,30 @@ function specContext(state: PrState, review?: ReviewConfig): Record<string, unkn
     seedTimeoutSeconds: String(review.analysis.seedTimeoutSeconds),
     reconcileTimeoutSeconds: String(review.analysis.reconcileTimeoutSeconds),
     /**
-     * WP11c — the `survey` fan-out's concurrency CEILING, read by
-     * `max_concurrent: { from: surveyConcurrency, default: 6 }`.
-     *
-     * Projected unconditionally alongside `analysisEnabled` (not under the
-     * probes branch) because the fan-out is the surveys themselves, not a probe
-     * affordance. The run clamps it again per backend — gondolin pins to 1 — so
-     * this is the operator's ask, never the effective value.
+     * The `site-review` fan-out's concurrency CEILING, read by
+     * `max_concurrent: { from: siteConcurrency, default: 6 }`. The run clamps
+     * it again per backend — gondolin pins to 1 — so this is the operator's
+     * ask, never the effective value.
      */
-    surveyConcurrency: String(review.analysis.surveyConcurrency),
+    siteConcurrency: String(review.analysis.siteConcurrency),
+    /** `sites --plan --top`: how many ranked sites get an investigator. */
+    siteTop: String(review.analysis.siteTop),
     /**
-     * The CONTROL arm — `--contract` on the `seed` phase's `lastlight-facts`
-     * invocation, and the argument `renderSpecObligations` above just took.
-     *
-     * Projected unconditionally beside `analysisEnabled` (not under the probes
-     * branch) because it governs the surveys themselves, and projected at all
-     * because the five facts-derived families are rendered by a CLI in the
-     * sandbox: the only way the operator's answer reaches them is through the
-     * phase's command line. `spec` gets it in-process, one call up. Two readers,
-     * one config key, so the sixth axis cannot silently stay on `full` while its
-     * five siblings move.
+     * `survey-units`' in-flight ceiling. Read by the handler itself (a
+     * `max_concurrent` key is fan-out-only in the schema).
+     */
+    surveyUnitConcurrency: String(review.analysis.surveyUnitConcurrency),
+    /**
+     * `survey-units`' WHOLE-PHASE deadline, read as `timeout_seconds: { from:
+     * surveyUnitsTimeoutSeconds }` (issue #385: config is the only source of a
+     * budget). The handler arms one AbortController with it.
+     */
+    surveyUnitsTimeoutSeconds: String(review.analysis.surveyUnitsTimeoutSeconds),
+    /**
+     * `--contract` on the `seed` phase's `lastlight-facts` invocation. It is
+     * recorded in obligations.json, and all it changes now is how strictly the
+     * `discharge` post-check in `units-ingest` grades (`minimal` degrades it to
+     * a non-empty floor).
      *
      * A string like every other key here: the render context is projected to
      * strings, and the phase's shell defaults an empty value back to `minimal` —
@@ -1804,8 +1892,7 @@ function specContext(state: PrState, review?: ReviewConfig): Record<string, unkn
      *
      * Truncation itself is PER FAMILY (`FAMILY_CAPS` in
      * `packages/code-facts/src/seed.ts` — contract 12, enforcement 12, state
-     * 8, security 8, tests 8), because each family feeds exactly one survey
-     * branch and the cost is per branch. This key is applied after those
+     * 8, security 8, tests 8). This key is applied after those
      * ceilings and defaults to their sum, so an operator moving it only ever
      * matters once they have raised one.
      *
@@ -1856,46 +1943,6 @@ function specContext(state: PrState, review?: ReviewConfig): Record<string, unkn
      * `installed` off `env.json` and records what it could not run.
      */
     ...(review.analysis.probes !== "off" ? { probesEnabled: "true" } : {}),
-    /**
-     * #399's gate, and a third separate one — `skip_if: "dossierEnabled != true"`
-     * on the `dossier` phase, and the `{{#if dossierEnabled}}` pair that selects
-     * which half of `review-adjudicate.md` renders.
-     *
-     * Present only when the operator asked, so the absence rule holds here too:
-     * a deployment with the pipeline on and this off gets today's adjudicator
-     * byte-for-byte, and a typo anywhere still fails toward it. Its own key
-     * rather than a richer object because `evalSkipIf` compares scalars — the
-     * same reason `probesEnabled` is one.
-     *
-     * It gates BOTH halves of the change (the rendered input and the typed
-     * output) because they move one phase's measured surface together; see
-     * `ReviewAnalysisConfig.adjudicate`.
-     *
-     * `!= "legacy"` rather than `=== "dossier"`: `"jev"` (#399 idea 2) IMPLIES
-     * the dossier rendering and typed output — it only adds an extra
-     * annotation phase before `dossier`, never a different adjudicate input
-     * shape. Two adjudicate modes needing the dossier must not require two
-     * separate reads of this key.
-     */
-    ...(review.analysis.adjudicate !== "legacy" ? { dossierEnabled: "true" } : {}),
-    /**
-     * #399 idea 2's own gate — `skip_if: "jevClassifyEnabled != true"` on the
-     * `jev-classify` phase. A FOURTH separate key, same reasoning as
-     * `probesEnabled`/`dossierEnabled`: `evalSkipIf` compares scalars, and
-     * this is a third, narrower decision than "render the dossier" — run one
-     * TypeSafe call per hypothesis and annotate it in.
-     *
-     * Present only when the operator asked for `"jev"` specifically, so the
-     * absence rule holds a third time: a deployment on `"dossier"` gets
-     * exactly what it measured, with no annotation phase added underneath it.
-     */
-    ...(review.analysis.adjudicate === "jev"
-      ? {
-          jevClassifyEnabled: "true",
-          jevModel: review.analysis.jevModel ?? "",
-          jevTimeoutSeconds: String(review.analysis.jevTimeoutSeconds),
-        }
-      : {}),
     /**
      * The three sub-switches, projected only when probes are on at all.
      *
@@ -1949,6 +1996,9 @@ function specContext(state: PrState, review?: ReviewConfig): Record<string, unkn
           prepareTimeoutSeconds: String(review.analysis.prepareTimeoutSeconds),
           coverageTimeoutSeconds: String(review.analysis.coverageTimeoutSeconds),
           probeRounds: String(review.analysis.probeRounds),
+          // `probe-plan`'s cap, read by the phase's shell. `null` renders as
+          // the literal `"null"`, which the phase maps to "no --max-probes".
+          maxProbes: review.analysis.maxProbes === null ? "null" : String(review.analysis.maxProbes),
           falsifyTimeoutSeconds: String(review.analysis.falsifyTimeoutSeconds),
           /**
            * The PHASE's ceiling, which is not any one step's.
@@ -1978,16 +2028,23 @@ function specContext(state: PrState, review?: ReviewConfig): Record<string, unkn
           ),
         }
       : {}),
-    // The PR's own description — what the AUTHOR says they did.
-    prBody: state.body,
-    // The issues it closes — what was ASKED, fenced as reference material by
-    // `renderLinkedIssues` for the same reason `priorNotes` is fenced: this is
-    // text a stranger wrote, and it must never read as instructions to the agent.
-    linkedIssues: renderLinkedIssues(state.closes),
-    // A `{{#if specObligations}}`-able string. Absent (not empty) when there is
-    // genuinely nothing to say AND nothing degraded — but a DEGRADED set still
-    // renders, because "we could not look" and "we looked and it is fine" must
-    // stay distinguishable (locked decision 6).
-    ...(rendered ? { specObligations: rendered } : {}),
+    /**
+     * The spec obligation set, raw, for `lastlight-facts units` — which cuts spec
+     * obligations into units and so needs ids, criteria and candidates, not
+     * prose. The `units` phase writes it to
+     * `.lastlight/pr-review/spec-obligations.json` through a QUOTED heredoc, so
+     * this must stay ONE line (`JSON.stringify` with no indent never emits a raw
+     * newline — string newlines are `\n` escapes) and can therefore never equal
+     * the heredoc's delimiter line. Absent when there is nothing to say and
+     * nothing degraded, so that case writes no file.
+     *
+     * `{` inside a string is escaped as `\u007b` wherever it would sit next to
+     * another `{`: the bash-phase guard (`validateShellCommand`) rejects any
+     * rendered command containing `{{`, and a PR body is text a stranger wrote.
+     * The escape is JSON, so the file parses back to the identical object.
+     * (JSON's own structure never puts two `{` side by side — an object's first
+     * token is a string key — so every `{{` is inside a string.)
+     */
+    ...(hasSpec ? { specObligationsJson: specObligationsLine(specSet) } : {}),
   };
 }

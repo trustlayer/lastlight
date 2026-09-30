@@ -51,7 +51,6 @@ import {
   isDependencyImpact,
   isDiagnosisClass,
   isReviewTrigger,
-  coerceAdjudicateMode,
   coerceProbeMode,
   reviewTriggerRank,
   type DependenciesConfig,
@@ -1251,6 +1250,16 @@ function sanitizeReview(
         out.skipUnchangedDiff = value;
         break;
       }
+      case "placeholderCheck":
+      case "sweepPendingGraceMinutes":
+        // Operator-only: both are about how THIS deployment presents and paces
+        // reviews across every repo it serves, not a per-repo caution dial.
+        warn(
+          "key-not-allowed",
+          path,
+          `Ignored "${path}": this key is set by the deployment operator only.`,
+        );
+        break;
       case "triage":
         // Operator-only for the same reason `analysis` is, one line below: it
         // is spend. A repo turning triage ON would buy a cheap pass on the
@@ -1664,6 +1673,9 @@ function shapeReview(raw: unknown): ReviewPolicy {
   const node = isPlainObject(raw) ? raw : {};
   return {
     postsCheck: typeof node.postsCheck === "boolean" ? node.postsCheck : d.postsCheck,
+    // Operator-only (dropped from a repo layer below), projected like the rest.
+    placeholderCheck: node.placeholderCheck !== false,
+    sweepPendingGraceMinutes: num(node.sweepPendingGraceMinutes, d.sweepPendingGraceMinutes),
     trigger: isReviewTrigger(node.trigger) ? node.trigger : d.trigger,
     requestLabel: typeof node.requestLabel === "string" && node.requestLabel.trim() ? node.requestLabel.trim() : null,
     skipDraft: typeof node.skipDraft === "boolean" ? node.skipDraft : d.skipDraft,
@@ -1698,14 +1710,13 @@ function shapeReviewAnalysis(raw: unknown, d: ReviewPolicy["analysis"]): ReviewP
     // Operator-only like the rest of `review.analysis`, so this only ever
     // projects the operator's answer into the merged view. `minimal` or nothing.
     obligationContract: node.obligationContract === "minimal" ? "minimal" : d.obligationContract,
-    // Operator-only as well, and the most important one to keep that way: it
-    // selects a phase SHAPE whose measured surface differs from the archive's.
-    adjudicate: coerceAdjudicateMode(node.adjudicate),
     // Operator-only projection too. A plain string — the CLI (`--mint`) is the
     // loud validator, exactly as for obligationContract above.
     mint: typeof node.mint === "string" ? node.mint : d.mint,
-    surveyPasses: num(node.surveyPasses, d.surveyPasses),
-    surveyConcurrency: num(node.surveyConcurrency, d.surveyConcurrency),
+    // `surveyConcurrency` is the old name, read when the new one is absent.
+    siteConcurrency: num(node.siteConcurrency, num(node.surveyConcurrency, d.siteConcurrency)),
+    siteTop: num(node.siteTop, d.siteTop),
+    surveyUnitConcurrency: num(node.surveyUnitConcurrency, d.surveyUnitConcurrency),
     // Tri-state (`off` | `static` | `full`), with a bare `true` reading as
     // `static` so an upgrade never silently buys an install. Operator-only
     // like the rest of `review.analysis`, so this only projects the
@@ -1715,14 +1726,14 @@ function shapeReviewAnalysis(raw: unknown, d: ReviewPolicy["analysis"]): ReviewP
     probeTypecheck: node.probeTypecheck === true,
     probeCoverage: node.probeCoverage === true,
     probeRounds: num(node.probeRounds, d.probeRounds),
+    // Operator-only projection; nullable like `maxBodyComments` below.
+    maxProbes: node.maxProbes === null ? null : num(node.maxProbes, d.maxProbes ?? 0),
     maxInlineComments: num(node.maxInlineComments, d.maxInlineComments),
     // Nullable like `fix.maxCostUsd`: an explicit `null` is the documented
     // "unlimited body overflow" value, distinct from an absent key (the
     // shipped `0`). Operator-only like the rest of `review.analysis`, so this
     // only ever projects the operator's answer into the merged view.
     maxBodyComments: node.maxBodyComments === null ? null : num(node.maxBodyComments, d.maxBodyComments ?? 0),
-    // Operator-only projection, same reasoning as `mint`/`obligationContract`.
-    jevModel: typeof node.jevModel === "string" ? node.jevModel : d.jevModel,
   };
 }
 
