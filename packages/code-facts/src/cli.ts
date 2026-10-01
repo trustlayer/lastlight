@@ -106,9 +106,9 @@ Commands:
               phase already reads), plus units/ingest.json. Every obligation
               gets a row even when its unit failed — with unknown evidence
   sites       the \`sites\` review engine's deterministic steps: --plan (rank
-              sites, write one brief per slot; --top <n> sites, --pair for a
-              second investigator per site in slot 8+rank, --slots <n> the
-              fan-out's branch count), --check <site-id> (a site
+              sites, write one brief per slot plus sites/branches.json, the
+              fan-out manifest; --top <n> sites, --pair for a second
+              investigator per site as <site-id>-b), --check <site-id> (a site
               investigator's gate), --merge (pool the findings for \`select\`),
               --check-select (select's gate), --finalize (write findings.json)
   toolchain   print the pinned manifest and what actually resolved
@@ -150,6 +150,13 @@ passes; it reads no quote and judges no claim):
                       a unit owning more changed lines than this (default 40)
                       is surveyed once PER FAMILY — one unit per asked family,
                       each carrying only that family's obligations
+  --prior <file>      the prior review's units (default: <dir>/prior-review.json
+                      when it exists). Each unit gets a \`delta\` against it —
+                      new / changed / affected / unchanged — and the re-review
+                      scopes its sites to everything but \`unchanged\`
+  --risk-rules <f>    {"rules":[{glob,tier}]} — the repo's then the operator's
+                      risk rules, matched before the built-in ones. Each unit
+                      gets a \`risk\` tier (low/medium/high/critical)
   --never-fail        exit 0 whatever happened; the document says what did
   Exit 0 = full, or nothing to survey (\`coverage: "none"\`, said why). 3 =
   degraded. 2 = an input is missing — a \`coverage: "none"\` document is still
@@ -521,12 +528,16 @@ export function runCli(
         maxRequestChars: numberFlag(flags["max-chars"]),
         maxUnits: numberFlag(flags["max-units"]),
         familySplitLines: numberFlag(flags["family-split-lines"]),
+        priorPath: stringFlag(flags.prior),
+        riskRulesPath: stringFlag(flags["risk-rules"]),
         log,
       });
       writeDocument(out, result.document);
       const doc = result.document;
+      const deltas = doc.prior ? countBy(doc.units.map((u) => u.delta ?? "?")) : null;
       io.out(
         `units: ${doc.units.length} unit(s), coverage ${doc.coverage}, ${doc.units.filter((u) => u.truncated).length} truncated → ${out}` +
+          (deltas ? `\n  re-review against ${doc.prior!.head?.slice(0, 8) ?? "a prior review"}: ${deltas}` : "") +
           doc.degraded.map((d) => `\n  degraded: ${d.reason}`).join(""),
       );
       return neverFail ? EXIT_OK : result.exitCode;
@@ -582,7 +593,6 @@ export function runCli(
             writeSitePlan(dir, {
               ...(numberFlag(flags.top) !== undefined ? { top: numberFlag(flags.top) } : {}),
               ...(numberFlag(flags.window) !== undefined ? { window: numberFlag(flags.window) } : {}),
-              ...(numberFlag(flags.slots) !== undefined ? { slots: numberFlag(flags.slots) } : {}),
               ...(flags.pair === true ? { pair: true } : {}),
             }),
           ),
@@ -859,4 +869,11 @@ if (isMain) {
     }
     process.exitCode = code;
   })();
+}
+
+/** `new 2, changed 1, unchanged 9` — a one-line tally in first-seen order. */
+function countBy(values: readonly string[]): string {
+  const counts = new Map<string, number>();
+  for (const v of values) counts.set(v, (counts.get(v) ?? 0) + 1);
+  return [...counts].map(([k, n]) => `${k} ${n}`).join(", ");
 }

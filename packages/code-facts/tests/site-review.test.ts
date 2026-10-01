@@ -9,6 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { runCli } from "../src/cli.js";
+import { lineHash } from "../src/review-delta.js";
 import { EXIT_DEGRADED, EXIT_OK } from "../src/errors.js";
 import { checkFindings } from "../src/findings.js";
 import {
@@ -73,23 +74,31 @@ function writeFindings(dir: string, siteId: string, lines: unknown[]): void {
 }
 
 describe("sites --plan", () => {
-  it("writes one brief per slot, ranks by voters, and marks the slots past the last site empty", () => {
+  it("writes one brief per real site, ranked by voters — no slot past the last site", () => {
     const { dir } = workspace();
     const plan = writeSitePlan(dir);
-    expect(plan.slots.map((s) => [s.siteId, s.site?.startLine ?? null, s.noneChecks])).toEqual([
+    expect(plan.slots.map((s) => [s.siteId, s.site.startLine, s.noneChecks])).toEqual([
       ["site-001", 10, 1],
       ["site-002", 150, 1],
-      ["site-003", null, 0],
-      ["site-004", null, 0],
-      ["site-005", null, 0],
     ]);
     const brief = readFileSync(join(dir, "sites", "site-001.md"), "utf8");
     expect(brief).toContain("site-001");
     expect(brief).toContain(".lastlight/pr-review/sites/site-001.findings.jsonl");
     // No leads: the graded arm A.
     expect(brief).toContain("No leads are given");
-    expect(readFileSync(join(dir, "sites", "site-004.md"), "utf8")).toContain('{"site":"site-004","empty":true}');
-    expect(readSitePlan(dir)?.slots).toHaveLength(5);
+    expect(existsSync(join(dir, "sites", "site-003.md"))).toBe(false);
+    expect(readSitePlan(dir)?.slots).toHaveLength(2);
+  });
+
+  it("writes branches.json — the manifest site-review fans out over — listing only real slots", () => {
+    const { dir } = workspace();
+    writeSitePlan(dir);
+    expect(JSON.parse(readFileSync(join(dir, "sites", "branches.json"), "utf8"))).toEqual({
+      items: [{ id: "site-001" }, { id: "site-002" }],
+    });
+    // Nothing is pre-written: every slot waits for its investigator.
+    expect(existsSync(join(dir, "sites", "site-001.findings.jsonl"))).toBe(false);
+    expect(existsSync(join(dir, "sites", "site-002.findings.jsonl"))).toBe(false);
   });
 
   it("fills the slots the code sites leave free with test-file sites, and never lets one displace a code site", () => {
@@ -98,48 +107,55 @@ describe("sites --plan", () => {
     const testRows = [at("src/a.test.ts", 5, "u5"), at("src/a.test.ts", 6, "u6"), at("src/a.test.ts", 7, "u7")];
     writeFileSync(join(dir, "hypotheses", "tests.jsonl"), `${testRows.map((r) => JSON.stringify(r)).join("\n")}\n`);
     const plan = writeSitePlan(dir);
-    expect(plan.slots.slice(0, 3).map((s) => s.site?.path ?? null)).toEqual(["src/a.ts", "src/a.ts", "src/a.test.ts"]);
+    expect(plan.slots.slice(0, 3).map((s) => s.site.path)).toEqual(["src/a.ts", "src/a.ts", "src/a.test.ts"]);
     expect(plan.testSites).toBe(1);
     // At top 2 the code sites keep both slots.
-    expect(writeSitePlan(dir, { top: 2 }).slots.map((s) => s.site?.path)).toEqual(["src/a.ts", "src/a.ts"]);
+    expect(writeSitePlan(dir, { top: 2 }).slots.map((s) => s.site.path)).toEqual(["src/a.ts", "src/a.ts"]);
   });
 
-  it("closes an empty slot's gate up front, so no investigator has to write it", () => {
-    const { dir, repo } = workspace();
-    writeSitePlan(dir);
-    expect(checkSiteSlot({ dir, repo, siteId: "site-004" }).satisfied).toBe(true);
-    // A slot WITH a site still waits for its investigator.
-    expect(existsSync(join(dir, "sites", "site-001.findings.jsonl"))).toBe(false);
-  });
-
-  it("pairs: a second investigator on every selected site, in slot 8 + rank", () => {
+  it("pairs: a second investigator on every real site, as `<site-id>-b`", () => {
     const { dir } = workspace();
-    const plan = writeSitePlan(dir, { top: 3, pair: true, slots: 16 });
-    const bySlot = new Map(plan.slots.map((s) => [s.slot, s]));
-    expect(plan.slots).toHaveLength(16);
-    expect([1, 2, 3, 4, 8].map((n) => bySlot.get(n)?.site?.startLine ?? null)).toEqual([10, 150, null, null, null]);
-    expect(bySlot.get(9)).toMatchObject({ siteId: "site-009", pairOf: "site-001", site: { startLine: 10 } });
-    expect(bySlot.get(10)).toMatchObject({ siteId: "site-010", pairOf: "site-002", site: { startLine: 150 } });
-    // Rank 3 has no site, so neither does its pair; past top, nothing.
-    expect([11, 12, 16].map((n) => bySlot.get(n)?.site ?? null)).toEqual([null, null, null]);
-    expect(bySlot.get(11)?.pairOf).toBeUndefined();
+    const plan = writeSitePlan(dir, { top: 3, pair: true });
+    expect(plan.slots.map((s) => [s.slot, s.siteId, s.site.startLine, s.pairOf ?? null])).toEqual([
+      [1, "site-001", 10, null],
+      [2, "site-002", 150, null],
+      [3, "site-001-b", 10, "site-001"],
+      [4, "site-002-b", 150, "site-002"],
+    ]);
+    expect(JSON.parse(readFileSync(join(dir, "sites", "branches.json"), "utf8")).items).toEqual([
+      { id: "site-001" },
+      { id: "site-002" },
+      { id: "site-001-b", pair: true },
+      { id: "site-002-b", pair: true },
+    ]);
     // The pair gets the same site under its own id, output file and scratch dir.
-    const brief = readFileSync(join(dir, "sites", "site-009.md"), "utf8");
-    expect(brief).toContain(".lastlight/pr-review/sites/site-009.findings.jsonl");
-    expect(brief).toContain(".lastlight/pr-review/sites/site-009/");
+    const brief = readFileSync(join(dir, "sites", "site-001-b.md"), "utf8");
+    expect(brief).toContain(".lastlight/pr-review/sites/site-001-b.findings.jsonl");
+    expect(brief).toContain(".lastlight/pr-review/sites/site-001-b/");
   });
 
-  it("without pair, plans every slot the fan-out declares and leaves the pair range empty", () => {
-    const { dir } = workspace();
-    const plan = writeSitePlan(dir, { top: 8, slots: 16 });
-    expect(plan.slots.filter((s) => s.site).map((s) => s.siteId)).toEqual(["site-001", "site-002"]);
-    expect(plan.slots.some((s) => s.pairOf)).toBe(false);
+  it("reads a pre-#423 plan (sixteen static slots, empties `site: null`) as its real slots only", () => {
+    // Stored eval runs hold this shape, and `micro-select` replays their merge.
+    const { dir, repo } = workspace();
+    const plan = writeSitePlan(dir);
+    const legacy = {
+      ...plan,
+      slots: [
+        ...plan.slots,
+        { slot: 3, siteId: "site-003", site: null, noneChecks: 0 },
+        { slot: 9, siteId: "site-009", site: null, noneChecks: 0 },
+      ],
+    };
+    writeFileSync(join(dir, "sites", "plan.json"), JSON.stringify(legacy));
+    writeFindings(dir, "site-003", [{ site: "site-003", empty: true }]);
+    expect(readSitePlan(dir)?.slots.map((s) => s.siteId)).toEqual(["site-001", "site-002"]);
+    writeFindings(dir, "site-001", [finding("site-001", 12)]);
+    expect(mergeSiteFindings({ dir, repo }).slots.map((s) => s.siteId)).toEqual(["site-001", "site-002"]);
   });
 
-  it("refuses a top past the maximum, or slots that cannot hold the plan", () => {
+  it("refuses a top past the maximum", () => {
     const { dir } = workspace();
     expect(() => writeSitePlan(dir, { top: 9 })).toThrow(/top must be 1…8/);
-    expect(() => writeSitePlan(dir, { top: 5, pair: true, slots: 10 })).toThrow(/needs 13/);
   });
 
   it("clears the last head's sites first", () => {
@@ -152,11 +168,9 @@ describe("sites --plan", () => {
 });
 
 describe("sites --check", () => {
-  it("accepts an `empty` line only on a slot the plan left empty", () => {
+  it("never accepts an `empty` line — every slot has a site", () => {
     const { repo, dir } = workspace();
     writeSitePlan(dir);
-    writeFindings(dir, "site-004", [{ site: "site-004", empty: true }]);
-    expect(checkSiteSlot({ dir, repo, siteId: "site-004" }).satisfied).toBe(true);
     writeFindings(dir, "site-001", [{ site: "site-001", empty: true }]);
     const real = checkSiteSlot({ dir, repo, siteId: "site-001" });
     expect(real.satisfied).toBe(false);
@@ -191,7 +205,7 @@ describe("sites --merge", () => {
     expect(merge.groups).toEqual([["F1", "F2", "F3"]]);
     expect(merge.findings[0].excerpt).toContain(">");
     expect(merge.findings[0].lineText).toBe("const line12 = 12;");
-    expect(merge.slots.map((s) => s.outcome)).toEqual(["findings", "findings", "empty", "empty", "empty"]);
+    expect(merge.slots.map((s) => s.outcome)).toEqual(["findings", "findings"]);
     expect(renderSiteMerge(merge)).toContain("## F4");
     expect(renderSiteMerge(merge)).not.toContain(SITE_MERGE_EMPTY_MARKER);
   });
@@ -395,5 +409,182 @@ describe("the `sites` command", () => {
     expect(runCli(["sites", "--check-select", "--dir", dir], io)).toBe(EXIT_OK);
     expect(runCli(["sites", "--finalize", "--dir", dir, "--repo", repo], io)).toBe(EXIT_OK);
     expect(JSON.parse(readFileSync(join(dir, "findings.json"), "utf8")).findings).toEqual([]);
+  });
+});
+
+// ── re-review scoping, the convergence gate and coverage (issue #429) ───────
+
+describe("re-review: scoping, the convergence gate and coverage", () => {
+  type U = { id: string; lines: [number, number]; delta?: string; risk?: string; touched?: number };
+  /** `units.json` for the `workspace()` checkout: u1–u3 own lines 5–25, u4 owns 140–160. */
+  function writeUnits(dir: string, units: U[]): void {
+    writeFileSync(
+      join(dir, "units.json"),
+      JSON.stringify({
+        units: units.map((u) => ({
+          kind: "symbol",
+          file: "src/a.ts",
+          symbol: u.id,
+          key: `src/a.ts::${u.id}`,
+          touched: u.touched ?? 3,
+          risk: u.risk ?? "medium",
+          ...u,
+        })),
+      }),
+    );
+  }
+  const site1Units = (delta: string, risk = "medium"): U[] =>
+    ["u1", "u2", "u3"].map((id) => ({ id, lines: [5, 25] as [number, number], delta, risk }));
+
+  it("carries the rows of unchanged units: they form no site and get no branch", () => {
+    const { dir } = workspace();
+    writeUnits(dir, [...site1Units("unchanged"), { id: "u4", lines: [140, 160], delta: "changed" }]);
+    const plan = writeSitePlan(dir);
+    expect(plan.carried).toBe(3);
+    expect(plan.slots.map((s) => [s.siteId, s.site.startLine])).toEqual([["site-001", 150]]);
+    expect(JSON.parse(readFileSync(join(dir, "sites", "branches.json"), "utf8"))).toEqual({ items: [{ id: "site-001" }] });
+  });
+
+  it("carries a row with neither a unit nor a path on a re-review, and keeps it on a first review", () => {
+    // units-ingest's family placeholder: no unit, no anchor — nothing to scope or look at.
+    const placeholder = { family: "enforcement", claim: "no enforcement hypothesis — 4 of 4 unit(s) answered, and none recorded one", bothEnds: { introducedAt: null, enforcedAt: null }, quotes: [], source: "units", unitId: null };
+    const withPlaceholder = () => {
+      const ws = workspace();
+      writeFileSync(join(ws.dir, "hypotheses", "enforcement.jsonl"), `${JSON.stringify(placeholder)}\n`);
+      return ws;
+    };
+    const first = withPlaceholder();
+    writeUnits(first.dir, [{ id: "u1", lines: [5, 25] }, { id: "u4", lines: [140, 160] }]);
+    expect(writeSitePlan(first.dir).slots.some((s) => s.site.path === null)).toBe(true);
+
+    const again = withPlaceholder();
+    writeUnits(again.dir, [...site1Units("unchanged"), { id: "u4", lines: [140, 160], delta: "changed" }]);
+    const plan = writeSitePlan(again.dir);
+    expect(plan.carried).toBe(4);
+    expect(plan.slots.map((s) => s.site.path)).toEqual(["src/a.ts"]);
+  });
+
+  it("keeps affected and new units in scope", () => {
+    const { dir } = workspace();
+    writeUnits(dir, [...site1Units("affected"), { id: "u4", lines: [140, 160], delta: "new" }]);
+    expect(writeSitePlan(dir).slots).toHaveLength(2);
+  });
+
+  it("plans no slot when every unit is unchanged — an empty manifest, an empty pool, a summary that says why", () => {
+    const { repo, dir } = workspace();
+    writeUnits(dir, [...site1Units("unchanged"), { id: "u4", lines: [140, 160], delta: "unchanged" }]);
+    const plan = writeSitePlan(dir, { pair: true });
+    expect(plan.slots).toEqual([]);
+    expect(JSON.parse(readFileSync(join(dir, "sites", "branches.json"), "utf8"))).toEqual({ items: [] });
+    const merge = writeSiteMerge(dir, repo);
+    expect(renderSiteMerge(merge).startsWith(SITE_MERGE_EMPTY_MARKER)).toBe(true);
+    finalizeSiteFindings({ dir, repo });
+    const doc = JSON.parse(readFileSync(join(dir, "findings.json"), "utf8"));
+    expect(doc.findings).toEqual([]);
+    expect(doc.summary).toMatch(/unchanged since the last review/);
+  });
+
+  it("drops a carried site's pair slot with it", () => {
+    const { dir } = workspace();
+    writeUnits(dir, [...site1Units("unchanged"), { id: "u4", lines: [140, 160], delta: "changed" }]);
+    const plan = writeSitePlan(dir, { pair: true });
+    expect(plan.slots.map((s) => s.siteId)).toEqual(["site-001", "site-001-b"]);
+    expect(plan.slots.every((s) => s.site.startLine === 150)).toBe(true);
+  });
+
+  it("weighs the vote by risk: two high-risk voters outrank three low-risk ones", () => {
+    const { dir } = workspace();
+    writeFileSync(
+      join(dir, "hypotheses", "state.jsonl"),
+      `${[at("src/a.ts", 150, "u4"), at("src/a.ts", 152, "u5")].map((r) => JSON.stringify(r)).join("\n")}\n`,
+    );
+    writeUnits(dir, [
+      ...site1Units("changed", "low"),
+      { id: "u4", lines: [140, 160], risk: "high" },
+      { id: "u5", lines: [140, 160], risk: "high" },
+    ]);
+    const plan = writeSitePlan(dir);
+    expect(plan.slots.map((s) => [s.site.startLine, s.site.risk])).toEqual([
+      [150, "high"],
+      [10, "low"],
+    ]);
+  });
+
+  /**
+   * Two sites investigated; the selection names one finding in each. The
+   * prior review recorded lines 1–100 of `src/a.ts`, so the finding at 12 is on
+   * code it already had and the one at 150 is on new code.
+   */
+  function gated(units: U[], importance: string, risk = "medium", withPrior = true) {
+    const ws = workspace();
+    writeUnits(ws.dir, units.map((u) => ({ ...u, risk })));
+    if (withPrior) {
+      const lines = Array.from({ length: 100 }, (_, i) => lineHash(`const line${i + 1} = ${i + 1};`)).join("");
+      writeFileSync(join(ws.dir, "prior-review.json"), JSON.stringify({ version: 1, head: "prior", units: [], files: { "src/a.ts": lines } }));
+    }
+    writePlan(ws.dir);
+    writeFindings(ws.dir, "site-001", [finding("site-001", 12, { importance })]);
+    writeFindings(ws.dir, "site-002", [finding("site-002", 150, { importance })]);
+    writeSiteMerge(ws.dir, ws.repo);
+    writeFileSync(
+      join(ws.dir, "sites", "selected.json"),
+      JSON.stringify({
+        items: [
+          { findings: ["F1"], title: "On unchanged code", importance },
+          { findings: ["F2"], title: "On changed code", importance },
+        ],
+      }),
+    );
+    const r = finalizeSiteFindings({ dir: ws.dir, repo: ws.repo });
+    const doc = JSON.parse(readFileSync(join(ws.dir, "findings.json"), "utf8"));
+    const byLine = (line: number) => doc.findings.find((f: { line: number }) => f.line === line);
+    return { r, at12: byLine(12), at150: byLine(150), dir: ws.dir };
+  }
+  const writePlan = (dir: string) => writeSitePlan(dir);
+  // Both sites stay in scope for PLANNING (an `affected` unit at 5–25, a
+  // changed one at 140–160) — what the gate judges is the finding's own lines.
+  const reached = (): U[] => [
+    ...site1Units("affected"),
+    { id: "u4", lines: [140, 160], delta: "changed" },
+  ];
+
+  it("withholds a worth-mentioning finding on lines the last review had, and posts its twin on new lines", () => {
+    const { r, at12, at150 } = gated(reached(), "worth-mentioning");
+    expect(at12).toMatchObject({ tier: "internal", withheld: "converged" });
+    expect(at150.tier).toBeUndefined();
+    expect(r).toMatchObject({ converged: 1, late: 0, posted: 1 });
+  });
+
+  it("posts a must-fix on unchanged lines, labelled as missed earlier", () => {
+    const { r, at12 } = gated(reached(), "must-fix");
+    expect(at12.tier).toBeUndefined();
+    expect(at12.lateDiscovery).toBe(true);
+    expect(at12.body).toMatch(/^\*\*Missed in an earlier review\.\*\*/);
+    expect(r).toMatchObject({ converged: 0, late: 1, posted: 2 });
+  });
+
+  it("withholds even a must-fix on unchanged LOW-risk code", () => {
+    const { at12 } = gated(reached(), "must-fix", "low");
+    expect(at12).toMatchObject({ tier: "internal", withheld: "converged" });
+  });
+
+  it("gates nothing on a first review", () => {
+    const firstReview: U[] = [
+      ...["u1", "u2", "u3"].map((id) => ({ id, lines: [5, 25] as [number, number] })),
+      { id: "u4", lines: [140, 160] },
+    ];
+    const { r, at12 } = gated(firstReview, "worth-mentioning", "medium", false);
+    expect(at12.tier).toBeUndefined();
+    expect(r).toMatchObject({ converged: 0, late: 0, posted: 2 });
+  });
+
+  it("writes review-coverage.json: surveyed and investigated per unit, carried units apart", () => {
+    const { dir } = gated([...reached(), { id: "u9", lines: [60, 70], delta: "unchanged" }], "worth-mentioning");
+    const cov = JSON.parse(readFileSync(join(dir, "review-coverage.json"), "utf8"));
+    expect(cov.rereview).toBe(true);
+    expect(cov.carried).toEqual({ units: 1, touched: 3 });
+    // u1–u3 and u4 are in scope; all had a site with findings, none was surveyed (no ingest.json).
+    expect(cov.inScope).toMatchObject({ units: 4, investigatedUnits: 4, surveyedUnits: 0, investigatedWeighted: 100 });
+    expect(cov.units.find((u: { id: string }) => u.id === "u9")).toMatchObject({ delta: "unchanged", investigated: null });
   });
 });
