@@ -978,6 +978,8 @@ export interface FinalizeResult {
   /** `selection` — `selected.json` held; `fallback` — one item per pooled finding. */
   source: "selection" | "fallback";
   fallbackReason: string | null;
+  /** `APPROVE` when nothing posts and every primary area answered; else `COMMENT`. */
+  event: "APPROVE" | "COMMENT";
   posted: number;
   recorded: number;
   hypotheses: number;
@@ -1059,6 +1061,7 @@ export function finalizeSiteFindings(opts: { dir: string; repo: string }): Final
   let posted = 0;
   let recorded = 0;
   let converged = 0;
+  let convergedMustFix = 0;
   let late = 0;
   for (const item of selection.items) {
     const primary = byId.get(item.primary ?? item.findings[0]);
@@ -1104,6 +1107,7 @@ export function finalizeSiteFindings(opts: { dir: string; repo: string }): Final
     if (nit || withheld) recorded++;
     else posted++;
     if (withheld) converged++;
+    if (withheld && item.importance === "must-fix") convergedMustFix++;
     else if (verdict === "late" && !nit) late++;
   }
 
@@ -1121,9 +1125,33 @@ export function finalizeSiteFindings(opts: { dir: string; repo: string }): Final
       : rereview && siteCount === 0
         ? "Nothing new to investigate: the code this review covers is unchanged since the last review."
         : `Investigated ${siteCount} area(s) of this change and found nothing worth raising.`);
+  // APPROVE only when the review ran AND found nothing to say. Every primary
+  // area must have answered — a slot that wrote nothing (or a `none` that
+  // failed its checks) is an area nobody looked at, and "nothing found" over
+  // it is a claim the run cannot make. Pair slots are second opinions and do
+  // not gate. A converged finding is NEW — found late on code an earlier
+  // review already passed — and the gate chose not to post it; approving over
+  // a worth-mentioning one is that same decision, and nearly every re-review
+  // has some (nearform/skillspro#2113: 3, so it never approved). Only a
+  // withheld MUST-FIX (the gate withholds one on a low-risk unit) holds it
+  // back. Findings an earlier review POSTED and are still open, and a human's
+  // open CHANGES_REQUESTED, need GitHub and are core's `post-review` floor.
+  const unanswered = merge.slots.filter(
+    (s) => !pairSlots.has(s.siteId) && !(s.outcome === "findings" || (s.outcome === "none" && s.gateSatisfied)),
+  );
+  const approvalHeld =
+    posted > 0
+      ? null
+      : convergedMustFix > 0
+        ? `${convergedMustFix} must-fix finding(s) withheld on unchanged code`
+        : unanswered.length
+          ? `area(s) not investigated: ${unanswered.map((s) => `${s.siteId} (${s.outcome})`).join(", ")}`
+          : null;
+  const event = posted === 0 && approvalHeld === null ? "APPROVE" : "COMMENT";
+  if (approvalHeld) notes.push(`not approving: ${approvalHeld}`);
   const doc = {
     summary,
-    event: "COMMENT",
+    event,
     findings,
     internal: set.records.map((r) => r.id),
     siteReview: { source, fallbackReason, pooled: merge.findings.length, items: selection.items.length },
@@ -1147,12 +1175,12 @@ export function finalizeSiteFindings(opts: { dir: string; repo: string }): Final
   } catch (err) {
     notes.push(`coverage not written: ${err instanceof Error ? err.message : String(err)}`);
   }
-  return { source, fallbackReason, posted, recorded, hypotheses: set.records.length, converged, late, coverage, notes };
+  return { source, fallbackReason, event, posted, recorded, hypotheses: set.records.length, converged, late, coverage, notes };
 }
 
 export function renderFinalize(r: FinalizeResult): string {
   const lines = [
-    `sites --finalize: ${r.source === "selection" ? "selection" : `FALLBACK (${r.fallbackReason}) — one item per finding`} → ${r.posted} to post, ${r.recorded} recorded (nit or converged), ${r.hypotheses} hypothesis row(s) filed internal`,
+    `sites --finalize: ${r.source === "selection" ? "selection" : `FALLBACK (${r.fallbackReason}) — one item per finding`} → ${r.posted} to post, ${r.recorded} recorded (nit or converged), ${r.hypotheses} hypothesis row(s) filed internal, event ${r.event}`,
     ...(r.converged || r.late
       ? [`  re-review gate: ${r.converged} withheld on unchanged code, ${r.late} must-fix on unchanged code posted as missed earlier`]
       : []),

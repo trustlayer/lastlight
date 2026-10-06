@@ -73,6 +73,15 @@ function writeFindings(dir: string, siteId: string, lines: unknown[]): void {
   writeFileSync(join(dir, "sites", `${siteId}.findings.jsonl`), `${lines.map((l) => JSON.stringify(l)).join("\n")}\n`);
 }
 
+/** A `none` answer that closes its gate: two checked suspicions, executed, with transcripts that echo them. */
+function provenNone(dir: string, siteId: string): Record<string, unknown> {
+  const command = "node -e 1";
+  const transcript = `sites/${siteId}.none.txt`;
+  writeFileSync(join(dir, transcript), `$ ${command}\n(no output)\n`);
+  const check = { suspicion: "s", command, transcript, outcome: "held" };
+  return { site: siteId, none: true, reason: "r", checked: [check, check] };
+}
+
 describe("sites --plan", () => {
   it("writes one brief per real site, ranked by voters — no slot past the last site", () => {
     const { dir } = workspace();
@@ -382,6 +391,41 @@ describe("sites --check-select and --finalize", () => {
     expect(doc.summary).toMatch(/^Investigated 2 area\(s\)/);
   });
 
+  it("approves only a clean review: nothing posted and every primary area answered", () => {
+    // Clean: one area found only a nit, the other proved nothing there.
+    const clean = workspace();
+    writeSitePlan(clean.dir);
+    writeFindings(clean.dir, "site-001", [finding("site-001", 12, { importance: "nit" })]);
+    writeFindings(clean.dir, "site-002", [provenNone(clean.dir, "site-002")]);
+    writeSiteMerge(clean.dir, clean.repo);
+    const c = finalizeSiteFindings({ dir: clean.dir, repo: clean.repo });
+    const cleanDoc = JSON.parse(readFileSync(join(clean.dir, "findings.json"), "utf8"));
+    expect({ result: c.event, doc: cleanDoc.event, posted: c.posted }).toEqual({ result: "APPROVE", doc: "APPROVE", posted: 0 });
+
+    // A posted finding is a COMMENT.
+    const { repo, dir } = merged();
+    expect(finalizeSiteFindings({ dir, repo }).event).toBe("COMMENT");
+
+    // A primary area that never answered is not "nothing found".
+    const silent = workspace();
+    writeSitePlan(silent.dir);
+    writeFindings(silent.dir, "site-001", [provenNone(silent.dir, "site-001")]);
+    writeSiteMerge(silent.dir, silent.repo);
+    const s = finalizeSiteFindings({ dir: silent.dir, repo: silent.repo });
+    expect(s.event).toBe("COMMENT");
+    expect(s.notes.join("\n")).toMatch(/site-002 \(missing\)/);
+  });
+
+  it("does not let a dead pair slot hold back an approval its primary earned", () => {
+    const ws = workspace();
+    writeSitePlan(ws.dir, { pair: true, slots: 16 });
+    const plan = readSitePlan(ws.dir)!;
+    for (const slot of plan.slots.filter((s) => !s.pairOf))
+      writeFindings(ws.dir, slot.siteId, [provenNone(ws.dir, slot.siteId)]);
+    writeSiteMerge(ws.dir, ws.repo);
+    expect(finalizeSiteFindings({ dir: ws.dir, repo: ws.repo }).event).toBe("APPROVE");
+  });
+
   it("falls back to one item per finding when the selection is missing", () => {
     const { repo, dir } = merged();
     const r = finalizeSiteFindings({ dir, repo });
@@ -566,6 +610,25 @@ describe("re-review: scoping, the convergence gate and coverage", () => {
   it("withholds even a must-fix on unchanged LOW-risk code", () => {
     const { at12 } = gated(reached(), "must-fix", "low");
     expect(at12).toMatchObject({ tier: "internal", withheld: "converged" });
+  });
+
+  it("approves a re-review whose only finding is withheld on unchanged code — unless it is a must-fix", () => {
+    const only = (importance: string, risk: string) => {
+      const ws = workspace();
+      writeUnits(ws.dir, reached().map((u) => ({ ...u, risk })));
+      const lines = Array.from({ length: 100 }, (_, i) => lineHash(`const line${i + 1} = ${i + 1};`)).join("");
+      writeFileSync(join(ws.dir, "prior-review.json"), JSON.stringify({ version: 1, head: "prior", units: [], files: { "src/a.ts": lines } }));
+      writePlan(ws.dir);
+      writeFindings(ws.dir, "site-001", [finding("site-001", 12, { importance })]);
+      writeFindings(ws.dir, "site-002", [provenNone(ws.dir, "site-002")]);
+      writeSiteMerge(ws.dir, ws.repo);
+      writeFileSync(join(ws.dir, "sites", "selected.json"), JSON.stringify({ items: [{ findings: ["F1"], title: "Late", importance }] }));
+      return finalizeSiteFindings({ dir: ws.dir, repo: ws.repo });
+    };
+    // nearform/skillspro#2113: worth-mentioning findings withheld on code the last review passed.
+    expect(only("worth-mentioning", "medium")).toMatchObject({ converged: 1, posted: 0, event: "APPROVE" });
+    // A must-fix the gate withheld (low-risk unit) is not a clean bill.
+    expect(only("must-fix", "low")).toMatchObject({ converged: 1, posted: 0, event: "COMMENT" });
   });
 
   it("gates nothing on a first review", () => {
