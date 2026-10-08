@@ -973,7 +973,7 @@ export function getIssueFilter(): IssueFilterConfig {
   return currentConfig?.issueFilter ?? normalizeIssueFilter(undefined);
 }
 
-const DEFAULT_MODEL = "anthropic/claude-sonnet-4-6";
+const DEFAULT_MODEL = "anthropic/claude-sonnet-5-5";
 
 function defaultConfigPath(): string {
   const cwdPath = resolve("config/default.yaml");
