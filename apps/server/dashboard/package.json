@@ -19,7 +19,7 @@
     "agentic-pi": "workspace:*",
     "ansi-to-html": "^0.7.2",
     "clsx": "^2.1.1",
-    "dompurify": "^3.4.16",
+    "dompurify": "^3.4.17",
     "lucide-react": "^1.48.0",
     "marked": "^18.0.14",
     "prismjs": "^1.30.0",
@@ -39,7 +39,7 @@
     "postcss": "^8.5.28",
     "tailwindcss": "^4.3.3",
     "typescript": "^7.0.2",
-    "vite": "^8.3.1",
+    "vite": "^8.3.3",
     "vitest": "^5.0.2"
   }
 }

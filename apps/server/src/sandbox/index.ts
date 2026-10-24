@@ -80,6 +80,8 @@ export function setupTaskWorktree(opts: {
     runId?: string;
     /** Clone shallowly (`--depth 1 --single-branch`) for read-only workflows. */
     shallow?: boolean;
+    /** Ref to fetch the head from instead of `branch` (see PrePopulate). */
+    headFetchRef?: string;
   };
 }): string {
   const sandboxBase = resolve(opts.sandboxDir || join(opts.stateDir, "sandboxes"));
@@ -130,6 +132,8 @@ export async function createTaskSandbox(opts: {
     runId?: string;
     /** Clone shallowly (`--depth 1 --single-branch`) for read-only workflows. */
     shallow?: boolean;
+    /** Ref to fetch the head from instead of `branch` (see PrePopulate). */
+    headFetchRef?: string;
   };
   /**
    * IP of the coredns sidecar to use as the sandbox's DNS resolver.
@@ -267,6 +271,15 @@ type PrePopulate = {
   runId?: string;
   shallow?: boolean;
   recreateFromBase?: boolean;
+  /**
+   * The ref the head is FETCHED from, when `branch` is not on origin — a fork
+   * PR's head branch lives on the fork, so `clone --branch <head>` against
+   * origin fails and the missing-branch fallback silently checks out the
+   * DEFAULT branch under the PR's branch name (a review of `main`, not the PR).
+   * Set to `refs/pull/<N>/head`, which the base repo always carries. `branch`
+   * stays the LOCAL branch name.
+   */
+  headFetchRef?: string;
 };
 
 /**
@@ -472,6 +485,10 @@ export function prePopulateWorkspace(
     cloneDefaultAndCreateBranch(repoDir, url, authArgs, depth, shallowArgs, pre, markerPath, start, scrub);
     return;
   }
+  if (pre.headFetchRef) {
+    cloneFromFetchRef(repoDir, url, authArgs, depth, shallowArgs, pre, markerPath, start, scrub);
+    return;
+  }
   try {
     gitCloneWithRetry(
       [...authArgs, "clone", "--branch", pre.branch, "--depth", depth, ...shallowArgs, url, repoDir],
@@ -513,6 +530,87 @@ export function prePopulateWorkspace(
       reason: firstError,
     });
     ensureRepoDir(repoDir);
+  }
+}
+
+/**
+ * Replace a checkout that must not be reviewed with an EMPTY directory. Not a
+ * bare delete: the backends pin the agent's cwd to `<workspace>/<repo>` (docker
+ * `exec -w`), so a missing dir fails the agent at start instead of reaching its
+ * MCP clone fallback. With no `.git` the next provision takes the fresh path,
+ * and `git clone` accepts an empty target.
+ */
+function discardCheckout(repoDir: string): void {
+  try {
+    rmSync(repoDir, { recursive: true, force: true });
+    mkdirSync(repoDir, { recursive: true });
+  } catch (err) {
+    log.warn("Could not discard the checkout", { repoDir, err });
+  }
+}
+
+/**
+ * Clone the head from `pre.headFetchRef` (a fork PR's `refs/pull/<N>/head`)
+ * and check it out as the local `pre.branch`. Clones the default branch first
+ * only to get a repository; the head is then fetched by ref and checked out
+ * over it.
+ *
+ * NO missing-branch fallback, on purpose: a failure here leaves an empty
+ * repo dir (the agent's MCP clone path), never the default branch under the
+ * PR's name — that fallback is what reviewed `main` for every fork PR.
+ */
+function cloneFromFetchRef(
+  repoDir: string,
+  url: string,
+  authArgs: string[],
+  depth: string,
+  shallowArgs: string[],
+  pre: PrePopulate,
+  markerPath: string,
+  start: number,
+  scrub: (s: unknown) => string,
+): void {
+  try {
+    execFileSync(
+      "git",
+      [...authArgs, "clone", "--depth", depth, ...shallowArgs, url, repoDir],
+      { stdio: "pipe", timeout: 120_000 },
+    );
+    execFileSync(
+      "git",
+      ["-C", repoDir, ...authArgs, "fetch", "--depth", depth, url, pre.headFetchRef!],
+      { stdio: "pipe", timeout: 120_000 },
+    );
+    execFileSync(
+      "git",
+      ["-C", repoDir, "checkout", "-B", pre.branch, "FETCH_HEAD"],
+      { stdio: "pipe", timeout: 30_000 },
+    );
+    normalizeOrigin(repoDir, pre);
+    ensureBaseAvailable(repoDir, pre, authArgs, url, scrub);
+    writeMarker(markerPath, pre.runId);
+    resetVerifyScript(repoDir);
+    resetPrNotesJournal(repoDir);
+    log.info("Pre-cloned head from fetch ref", {
+      owner: pre.owner,
+      repo: pre.repo,
+      branch: pre.branch,
+      ref: pre.headFetchRef,
+      repoDir,
+      depth,
+      durationMs: Date.now() - start,
+    });
+  } catch (err: any) {
+    const reason = scrub(err?.message) || scrub(err?.stderr?.toString?.()) || "unknown error";
+    // Never leave a half-built checkout of the default branch behind: a later
+    // phase would find a `.git` and review it.
+    discardCheckout(repoDir);
+    log.warn("Pre-clone from fetch ref failed — agent will need to clone via MCP", {
+      owner: pre.owner,
+      repo: pre.repo,
+      ref: pre.headFetchRef,
+      reason,
+    });
   }
 }
 
@@ -618,7 +716,7 @@ function ensureBaseAvailable(
   // has awkward depth semantics and can deepen much further than intended.
   const fetchBoth = (depthArgs: string[]): void => {
     try { run([...authArgs, "fetch", ...depthArgs, url, dest]); } catch { /* best-effort */ }
-    try { run([...authArgs, "fetch", ...depthArgs, url, pre.branch]); } catch { /* best-effort */ }
+    try { run([...authArgs, "fetch", ...depthArgs, url, pre.headFetchRef ?? pre.branch]); } catch { /* best-effort */ }
   };
   // Put the base into `remote.origin.fetch`, so the ref we materialize below is
   // also REFRESHABLE by a plain `git fetch origin <base>` — the fix prompt's own
@@ -742,7 +840,7 @@ function refreshExistingClone(
     // any credential into .git/config.
     execFileSync(
       "git",
-      ["-C", repoDir, ...authArgs, "fetch", ...depth, url, pre.branch],
+      ["-C", repoDir, ...authArgs, "fetch", ...depth, url, pre.headFetchRef ?? pre.branch],
       { stdio: "pipe", timeout: 120_000 },
     );
     execFileSync(
@@ -774,6 +872,18 @@ function refreshExistingClone(
     });
   } catch (err: any) {
     const reason = scrub(err?.message) || scrub(err?.stderr?.toString?.()) || "unknown error";
+    if (pre.headFetchRef) {
+      // A fork PR's existing checkout cannot be trusted to be the PR head — a
+      // workspace from before the fetch ref existed holds the default branch
+      // under the PR's name. Discard it rather than review it.
+      discardCheckout(repoDir);
+      log.warn("Refresh of reused fork-PR workspace failed — discarded the checkout", {
+        repoDir,
+        ref: pre.headFetchRef,
+        reason,
+      });
+      return;
+    }
     log.warn("Refresh of reused workspace failed — leaving it untouched; agent can re-fetch via MCP", {
       repoDir,
       reason,
