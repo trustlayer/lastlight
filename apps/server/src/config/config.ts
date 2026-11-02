@@ -197,6 +197,11 @@ export interface LastLightConfig {
    */
   botName: string;
   botLogin: string;
+  /**
+   * Bot logins (with the `[bot]` suffix) whose PRs are reviewed although every
+   * other bot-authored PR is skipped — e.g. `pullfrog[bot]`. Never `botLogin`.
+   */
+  reviewBotAuthors: string[];
   dbPath: string;
   /**
    * State DB URL, libsql-style (`file:/app/data/lastlight.db`, `:memory:`) or
@@ -1220,6 +1225,7 @@ export function loadConfig(): LastLightConfig {
     webhookSecret: process.env.WEBHOOK_SECRET || "",
     botName: fileCfg.botName,
     botLogin: process.env.BOT_LOGIN || `${fileCfg.botName}[bot]`,
+    reviewBotAuthors: fileCfg.reviewBotAuthors,
     stateDir,
     sandboxDir: join(stateDir, "sandboxes"),
     sessionsDir: resolve(process.env.LASTLIGHT_SESSIONS_DIR || join(stateDir, "agent-sessions")),
@@ -1285,6 +1291,7 @@ type NormalizedFileConfig = ReturnType<typeof normalizeFileConfig>;
 function normalizeFileConfig(raw: Record<string, unknown>): {
   managedRepos: string[];
   botName: string;
+  reviewBotAuthors: string[];
   routes: RouteConfig;
   disabled: DisabledConfig;
   crons: CronsConfig;
@@ -1323,6 +1330,7 @@ function normalizeFileConfig(raw: Record<string, unknown>): {
 } {
   const managedRepos = stringArray(raw.managedRepos, "managedRepos");
   const botName = typeof raw.botName === "string" && raw.botName.trim() ? raw.botName.trim() : "last-light";
+  const reviewBotAuthors = optionalStringArray(raw.reviewBotAuthors, "reviewBotAuthors");
   const routes = normalizeRoutes(raw.routes);
   const disabledRaw = isPlainObject(raw.disabled) ? raw.disabled : {};
   const modelsRaw = isPlainObject(raw.models) ? raw.models : {};
@@ -1754,6 +1762,7 @@ function normalizeFileConfig(raw: Record<string, unknown>): {
   return {
     managedRepos,
     botName,
+    reviewBotAuthors,
     routes,
     disabled: {
       workflows: optionalStringArray(disabledRaw.workflows, "disabled.workflows"),

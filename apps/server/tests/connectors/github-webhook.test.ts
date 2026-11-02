@@ -39,11 +39,12 @@ function sign(body: string): string {
   return "sha256=" + createHmac("sha256", SECRET).update(body).digest("hex");
 }
 
-function connector(): GitHubWebhookConnector {
+function connector(reviewBotAuthors?: string[]): GitHubWebhookConnector {
   return new GitHubWebhookConnector({
     port: 0,
     webhookSecret: SECRET,
     botLogin: BOT_LOGIN,
+    reviewBotAuthors,
   });
 }
 
@@ -115,6 +116,24 @@ describe("GitHubWebhookConnector — self-review guard", () => {
     });
     expect(status).toBe(202);
     expect(json.accepted).toBe(true);
+  });
+
+  it("drops another bot's PR unless reviewBotAuthors lists it", async () => {
+    const pr = { action: "opened", authorLogin: "pullfrog[bot]", senderLogin: "pullfrog[bot]" };
+    const dropped = await postPullRequest(connector(), pr);
+    expect(dropped.json.reason).toBe("bot-authored PR (self-review)");
+    const accepted = await postPullRequest(connector(["pullfrog[bot]"]), pr);
+    expect(accepted.status).toBe(202);
+    expect(accepted.json.accepted).toBe(true);
+  });
+
+  it("still drops our own PR when reviewBotAuthors lists our login", async () => {
+    const { json } = await postPullRequest(connector([BOT_LOGIN]), {
+      action: "opened",
+      authorLogin: BOT_LOGIN,
+      senderLogin: BOT_LOGIN,
+    });
+    expect(json.reason).toBe("bot-authored PR (self-review)");
   });
 
   it("accepts a normal human-authored PR (opened)", async () => {

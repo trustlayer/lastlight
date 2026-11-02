@@ -62,6 +62,12 @@ export interface ReviewDiscoverOptions {
    */
   botLogin?: string;
   /**
+   * Bot logins (with the `[bot]` suffix) whose PRs ARE reviewed despite the
+   * bot-author filter — e.g. `pullfrog[bot]`, another coding agent whose PRs
+   * want a human-grade review. `botLogin` itself never qualifies.
+   */
+  reviewBotAuthors?: readonly string[];
+  /**
    * Cap the candidates offered per repo per tick, so one busy repo can't spin
    * hundreds of dispatches at once. Oldest-first, so the cap is stable across
    * ticks rather than starving the same tail every time.
@@ -82,7 +88,7 @@ const DEFAULT_MAX_PER_REPO = 25;
 /**
  * Is this PR authored by a bot — ANY bot, not just us?
  *
- * The webhook route's predicate, verbatim (`connectors/github-webhook.ts` →
+ * The webhook route calls this same predicate (`connectors/github-webhook.ts` →
  * `isBotAuthoredPr`), because the two routes must answer this identically. They
  * did not: discovery compared against our own `botLogin` alone, so a PR opened
  * by a *different* App installed on the same repo was dropped by the webhook and
@@ -103,10 +109,17 @@ const DEFAULT_MAX_PER_REPO = 25;
  * a reader.
  *
  * `botLogin` is still checked explicitly — `BOT_LOGIN` may override it to a
- * string that does not carry the suffix.
+ * string that does not carry the suffix. It is checked FIRST, so listing it in
+ * `reviewBotAuthors` cannot re-open the self-review.
  */
-function isBotAuthored(authorLogin: string, botLogin: string): boolean {
-  return authorLogin === botLogin || authorLogin.endsWith("[bot]");
+export function isBotAuthored(
+  authorLogin: string,
+  botLogin: string,
+  reviewBotAuthors: readonly string[] = [],
+): boolean {
+  if (authorLogin === botLogin) return true;
+  if (reviewBotAuthors.includes(authorLogin)) return false;
+  return authorLogin.endsWith("[bot]");
 }
 
 export async function discoverPrsAwaitingReview(
@@ -136,7 +149,7 @@ export async function discoverPrsAwaitingReview(
     }
 
     const candidates = open
-      .filter((pr) => !isBotAuthored(pr.authorLogin, botLogin))
+      .filter((pr) => !isBotAuthored(pr.authorLogin, botLogin, opts.reviewBotAuthors))
       .sort((a, b) => a.number - b.number) // oldest first — deterministic, fair
       .slice(0, maxPerRepo);
 

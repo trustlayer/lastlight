@@ -11,6 +11,7 @@ import {
 } from "../managed-repos.js";
 import { getInstallationDirectory } from "../engine/github/installations.js";
 import { logger } from "../logging/logger.js";
+import { isBotAuthored } from "../cron/review-discovery.js";
 
 const log = logger("github");
 
@@ -24,6 +25,8 @@ export interface GitHubWebhookConfig {
   webhookSecret: string;
   /** Bot login name to ignore self-events */
   botLogin: string;
+  /** Bot PR authors that are reviewed anyway — see `LastLightConfig.reviewBotAuthors`. */
+  reviewBotAuthors?: readonly string[];
   /**
    * Shared Hono app to register `/webhooks/github` onto. When omitted, the
    * connector creates its own app (used by unit tests that drive it via
@@ -368,7 +371,7 @@ export class GitHubWebhookConnector extends EventEmitter implements Connector {
       const prAuthor = payload.pull_request?.user?.login || "";
       const isBotAuthoredPr =
         (isPrAttention || isPrReviewSignal) &&
-        (prAuthor === this.config.botLogin || prAuthor.endsWith("[bot]"));
+        isBotAuthored(prAuthor, this.config.botLogin, this.config.reviewBotAuthors);
       if (isBotAuthoredPr) {
         return c.json(
           { filtered: true, reason: "bot-authored PR (self-review)" },

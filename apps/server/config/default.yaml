@@ -16,6 +16,13 @@ managedRepos: []
 # Nearform app so it triggers on `@nearform-lastlight`.
 botName: last-light
 
+# Bot logins (with the `[bot]` suffix) whose pull requests get a review anyway.
+# By default every bot-authored PR is skipped: our own (GitHub rejects a
+# self-review) and Dependabot/Renovate (the dependabot crons own those). List
+# another coding agent here, e.g. `pullfrog[bot]`, to review its PRs like a
+# human's. The bot's own login never qualifies.
+reviewBotAuthors: []
+
 models:
   default: anthropic/claude-sonnet-5-5
   # The unit survey (`survey-units`), and the fall-through of `review-site`

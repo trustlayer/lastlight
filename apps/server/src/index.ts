@@ -1424,6 +1424,7 @@ async function main() {
       port: config.port,
       webhookSecret: config.webhookSecret,
       botLogin: config.botLogin,
+      reviewBotAuthors: config.reviewBotAuthors,
       app,
       // Settle-aware gate: emit a dependency-PR checks event only once the head
       // SHA's checks have fully settled (green/red), so a multi-app repo fires
@@ -1641,7 +1642,11 @@ async function main() {
     // all decided once by `resolveReviewTrigger` at the dispatch choke point,
     // which the webhook route crosses too.
     "prs-awaiting-review": (repos, gh, opts) =>
-      discoverPrsAwaitingReview(repos, gh, { ...opts, botLogin: config.botLogin }),
+      discoverPrsAwaitingReview(repos, gh, {
+        ...opts,
+        botLogin: config.botLogin,
+        reviewBotAuthors: config.reviewBotAuthors,
+      }),
     // The autonomy backstop sweep (`workflows/cron-autonomy.yaml`): find the
     // open issues sitting at a stage's `enter` label and fan out one bounded
     // single-issue run of the stage's workflow each. It closes the one gap the

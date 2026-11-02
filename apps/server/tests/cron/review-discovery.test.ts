@@ -113,6 +113,21 @@ describe("discoverPrsAwaitingReview", () => {
     expect(out.map((p) => p.prNumber)).toEqual([12]);
   });
 
+  it("offers a PR from a bot listed in reviewBotAuthors, but never our own", async () => {
+    const gh = fakeGh({
+      "yo61/repo": [
+        { number: 1, title: "ours", draft: false, authorLogin: "last-light[bot]" },
+        { number: 2, title: "pullfrog's PR", draft: false, authorLogin: "pullfrog[bot]" },
+        { number: 3, title: "dependabot's PR", draft: false, authorLogin: "dependabot[bot]" },
+      ],
+    });
+    const out = await discoverPrsAwaitingReview(["yo61/repo"], gh, {
+      botLogin: "last-light[bot]",
+      reviewBotAuthors: ["pullfrog[bot]", "last-light[bot]"],
+    });
+    expect(out.map((p) => p.prNumber)).toEqual([2]);
+  });
+
   it("still drops our own PR when BOT_LOGIN carries no `[bot]` suffix", async () => {
     // The suffix test covers every realistic login, so `botLogin` is only
     // load-bearing for an overridden one — which is exactly why it stays.
