@@ -241,6 +241,7 @@ function buildAnthropicMessages(args: {
         "content-type": "application/json",
         "x-api-key": apiKey,
         "anthropic-version": "2023-06-01",
+        ...spec.extraHeaders,
       },
       body: JSON.stringify({
         model: modelId,

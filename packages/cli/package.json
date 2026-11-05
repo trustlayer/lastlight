@@ -1,6 +1,6 @@
 {
   "name": "lastlight",
-  "version": "0.40.4",
+  "version": "0.41.0",
   "description": "Last Light CLI — a lean global client + host-local `server` lifecycle for the Last Light GitHub maintenance agent, plus the Claude Code plugin.",
   "type": "module",
   "bin": {
@@ -44,13 +44,13 @@
     "lastlight-code-facts": "workspace:*",
     "lastlight-shared": "workspace:*",
     "lastlight-workflow-engine": "workspace:*",
-    "chalk": "^6.0.0",
+    "chalk": "^6.0.1",
     "cli-table3": "^0.6.5"
   },
   "devDependencies": {
-    "@types/node": "^26.6.2",
+    "@types/node": "^26.6.6",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2",
-    "vitest": "^5.0.2"
+    "vitest": "^5.0.5"
   }
 }
