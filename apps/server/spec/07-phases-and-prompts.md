@@ -380,12 +380,14 @@ the issue or PR, and edits it. It posts a new comment only when it finds none,
 or when the lookup fails. The per-phase comment mode (no `status_checklist`)
 does not change: each message is still a new comment.
 
-`post-review` applies a similar rule to the formal review. When the review has
-no inline comment and no finding in the body, and its state (APPROVED or
-COMMENTED) is the same as our last review, it edits the body of that review
-(`PUT /pulls/{n}/reviews/{id}`). It does not submit a new one. A new finding, a
+`post-review` applies a similar rule to the formal review. A review with no
+finding carries the hidden tag `<!-- lastlight:review:summary-only -->`. Our
+last review can be tagged, and the new review can have no finding and the same
+state (APPROVED or COMMENTED). Then `post-review` edits the body of the last
+review (`PUT /pulls/{n}/reviews/{id}`) and submits no new review. A finding, a
 change of state, `REQUEST_CHANGES`, an explicit request, or a failed edit
-submits a new review.
+submits a new review. The edited review keeps its old `commit_id`. The
+`already-assessed` gate stops the sweep from a second run on the same head.
 
 ## Prompt vs skill — when to pick which
 
