@@ -169,3 +169,40 @@ describe("GitHubClient.getPrDiffFingerprint", () => {
     ).toMatch(/^[0-9a-f]{64}$/);
   });
 });
+
+describe("GitHubClient.findBotCommentWithMarker", () => {
+  const MARKER = "<!-- lastlight:status:pr-review -->";
+  function clientWithComments(comments: unknown[]): GitHubClient {
+    const listComments = async () => ({ data: comments });
+    return clientWith({
+      rest: { issues: { listComments } },
+      paginate: async () => comments,
+    });
+  }
+
+  it("returns the newest marked comment that the bot wrote", async () => {
+    const c = clientWithComments([
+      { id: 1, user: { login: "bot[bot]" }, body: `old\n${MARKER}` },
+      { id: 2, user: { login: "bot[bot]" }, body: "no marker" },
+      { id: 3, user: { login: "bot[bot]" }, body: `newer\n${MARKER}` },
+      { id: 4, user: { login: "human" }, body: `copied\n${MARKER}` },
+    ]);
+    expect(await c.findBotCommentWithMarker("o", "r", 7, MARKER, "bot[bot]")).toBe(3);
+  });
+
+  it("returns undefined when only a human comment carries the marker", async () => {
+    const c = clientWithComments([{ id: 4, user: { login: "human" }, body: MARKER }]);
+    expect(await c.findBotCommentWithMarker("o", "r", 7, MARKER, "bot[bot]")).toBeUndefined();
+  });
+});
+
+describe("GitHubClient.updatePullRequestReview", () => {
+  it("sends only the new body for the review id", async () => {
+    const calls: unknown[] = [];
+    const c = clientWith({
+      rest: { pulls: { updateReview: async (args: unknown) => { calls.push(args); return { data: {} }; } } },
+    });
+    await c.updatePullRequestReview("o", "r", 7, 99, "new body");
+    expect(calls).toEqual([{ owner: "o", repo: "r", pull_number: 7, review_id: 99, body: "new body" }]);
+  });
+});

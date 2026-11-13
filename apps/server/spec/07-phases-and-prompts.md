@@ -373,6 +373,20 @@ full reports in `output_var`s; a terminal `synthesize` phase (which depends only
 on the always-run text phase, so it still runs when the browser phase is gated
 out) folds them into one verdict that `final_message` drops into the footer.
 
+The checklist comment is also kept across runs. The GitHub transport adds the
+hidden marker `<!-- lastlight:status:<workflow> -->` to its body. On the first
+publish of a run, it finds the newest comment by `botLogin` with that marker on
+the issue or PR, and edits it. It posts a new comment only when it finds none,
+or when the lookup fails. The per-phase comment mode (no `status_checklist`)
+does not change: each message is still a new comment.
+
+`post-review` applies a similar rule to the formal review. When the review has
+no inline comment and no finding in the body, and its state (APPROVED or
+COMMENTED) is the same as our last review, it edits the body of that review
+(`PUT /pulls/{n}/reviews/{id}`). It does not submit a new one. A new finding, a
+change of state, `REQUEST_CHANGES`, an explicit request, or a failed edit
+submits a new review.
+
 ## Prompt vs skill — when to pick which
 
 They serve different purposes and can coexist on the same phase:

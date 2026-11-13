@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { GitHubTransport } from "#src/notify/transports/github.js";
+import { GitHubTransport, statusCommentMarker } from "#src/notify/transports/github.js";
 import { SlackTransport } from "#src/notify/transports/slack.js";
 import type { GitHubClient } from "#src/engine/github/github.js";
 import type { SlackConnector } from "#src/connectors/slack/connector.js";
@@ -61,6 +61,70 @@ describe("GitHubTransport", () => {
     const t = new GitHubTransport({ github, owner: "o", repo: "r", issueNumber: 7 });
     await t.publish("body", MODEL);
     expect(postComment).toHaveBeenCalledWith("o", "r", 7, "body");
+  });
+});
+
+describe("GitHubTransport sticky status comment", () => {
+  const MARKER = statusCommentMarker("pr-review");
+  const STICKY = { workflow: "pr-review", botLogin: "bot[bot]" };
+
+  it("edits the marked comment of an earlier run instead of posting a new one", async () => {
+    const findBotCommentWithMarker = vi.fn(async () => 321);
+    const postComment = vi.fn(async () => 1);
+    const updateComment = vi.fn(async () => {});
+    const github = { findBotCommentWithMarker, postComment, updateComment } as unknown as GitHubClient;
+    const saved: number[] = [];
+    const t = new GitHubTransport({
+      github, owner: "o", repo: "r", issueNumber: 7, sticky: STICKY, save: (id) => saved.push(id),
+    });
+
+    await t.publish("first");
+    await t.publish("second");
+
+    expect(findBotCommentWithMarker).toHaveBeenCalledTimes(1);
+    expect(findBotCommentWithMarker).toHaveBeenCalledWith("o", "r", 7, MARKER, "bot[bot]");
+    expect(postComment).not.toHaveBeenCalled();
+    expect(updateComment).toHaveBeenNthCalledWith(1, "o", "r", 321, `first\n\n${MARKER}`);
+    expect(updateComment).toHaveBeenNthCalledWith(2, "o", "r", 321, `second\n\n${MARKER}`);
+    expect(saved).toEqual([321]);
+  });
+
+  it("posts a marked comment when no earlier one exists", async () => {
+    const findBotCommentWithMarker = vi.fn(async () => undefined);
+    const postComment = vi.fn(async () => 555);
+    const updateComment = vi.fn(async () => {});
+    const github = { findBotCommentWithMarker, postComment, updateComment } as unknown as GitHubClient;
+    const t = new GitHubTransport({ github, owner: "o", repo: "r", issueNumber: 7, sticky: STICKY });
+
+    await t.publish("first");
+
+    expect(postComment).toHaveBeenCalledWith("o", "r", 7, `first\n\n${MARKER}`);
+    expect(updateComment).not.toHaveBeenCalled();
+  });
+
+  it("posts a marked comment when the lookup fails", async () => {
+    const findBotCommentWithMarker = vi.fn(async () => {
+      throw new Error("boom");
+    });
+    const postComment = vi.fn(async () => 555);
+    const github = { findBotCommentWithMarker, postComment, updateComment: vi.fn() } as unknown as GitHubClient;
+    const t = new GitHubTransport({ github, owner: "o", repo: "r", issueNumber: 7, sticky: STICKY });
+
+    await t.publish("first");
+
+    expect(postComment).toHaveBeenCalledWith("o", "r", 7, `first\n\n${MARKER}`);
+  });
+
+  it("skips the lookup when a resumed run already holds the comment id", async () => {
+    const findBotCommentWithMarker = vi.fn(async () => 321);
+    const updateComment = vi.fn(async () => {});
+    const github = { findBotCommentWithMarker, postComment: vi.fn(), updateComment } as unknown as GitHubClient;
+    const t = new GitHubTransport({ github, owner: "o", repo: "r", issueNumber: 7, commentId: 42, sticky: STICKY });
+
+    await t.publish("edit me");
+
+    expect(findBotCommentWithMarker).not.toHaveBeenCalled();
+    expect(updateComment).toHaveBeenCalledWith("o", "r", 42, `edit me\n\n${MARKER}`);
   });
 });
 
