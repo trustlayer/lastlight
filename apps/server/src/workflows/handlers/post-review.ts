@@ -53,12 +53,6 @@ import {
 import { resolveHostRepoDir } from "./host-repo-dir.js";
 
 const log = logger("post-review");
-
-/**
- * The hidden tag on a review that has no finding. `post-review` edits the body
- * of our last review only when that review carries this tag.
- */
-export const SUMMARY_ONLY_REVIEW_MARKER = "<!-- lastlight:review:summary-only -->";
 import type { ExecutorConfig } from "lastlight-workflow-engine";
 import type { TemplateContext } from "lastlight-workflow-engine";
 import type { PhaseDefinition } from "lastlight-workflow-engine";
@@ -943,13 +937,6 @@ export class GitHubPostReviewHandler implements PhaseTypeHandler {
       this.recordDisposition(hostRepoDir, boundary, review.tiered);
     }
 
-    // Tag a review that has no finding at all. Only a tagged review can be
-    // edited later, because an edit replaces the whole body, and the body of an
-    // untagged review can hold findings that are still open.
-    if (review.comments.length === 0 && review.demotedCount === 0) {
-      review = { ...review, body: `${review.body}\n\n${SUMMARY_ONLY_REVIEW_MARKER}` };
-    }
-
     const repeat = this.repeatOfLastReview(
       history.latest,
       review,
@@ -1097,8 +1084,6 @@ export class GitHubPostReviewHandler implements PhaseTypeHandler {
    * - The run is not an explicit request. A maintainer who asks for a review
    *   gets a new review.
    * - The review has no inline comment and no finding in the body.
-   * - Our last review carries {@link SUMMARY_ONLY_REVIEW_MARKER}, so it had no
-   *   finding either. The edit replaces its whole body.
    * - The event is APPROVE or COMMENT, and our last review has the same state.
    *   REQUEST_CHANGES always posts: the check run reads only the review at the
    *   current head, and a missing review concludes `neutral`, which passes.
@@ -1108,7 +1093,7 @@ export class GitHubPostReviewHandler implements PhaseTypeHandler {
     review: { event: string; comments: unknown[]; demotedCount: number },
     explicitRequest: boolean,
   ): { id: number; state: string; body: string | null } | null {
-    if (explicitRequest || !last?.body?.includes(SUMMARY_ONLY_REVIEW_MARKER)) return null;
+    if (explicitRequest || !last) return null;
     if (review.comments.length > 0 || review.demotedCount > 0) return null;
     const state =
       review.event === "APPROVE" ? "APPROVED" : review.event === "COMMENT" ? "COMMENTED" : null;

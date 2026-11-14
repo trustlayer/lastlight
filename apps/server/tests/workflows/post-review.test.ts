@@ -18,7 +18,7 @@ vi.mock("#src/workflows/loader.js", () => ({
   resolveSkillPaths: vi.fn(() => undefined),
 }));
 
-import { GitHubPostReviewHandler, SUMMARY_ONLY_REVIEW_MARKER, type PostReviewRunScope } from "#src/workflows/handlers/post-review.js";
+import { GitHubPostReviewHandler, type PostReviewRunScope } from "#src/workflows/handlers/post-review.js";
 import type { PhaseReporter } from "lastlight-workflow-engine";
 import type { TemplateContext } from "#src/workflows/templates.js";
 import type { AgentWorkflowDefinition, PhaseDefinition } from "#src/workflows/schema.js";
@@ -1234,7 +1234,6 @@ describe("post-review action (runPostReview)", () => {
    */
   describe("duplicate — word-for-word the review we already posted", () => {
     const SUMMARY = "Completes the ESLint 8 to 10 migration. No blocking issues.";
-    const tagged = (body: string) => `${body}\n\n${SUMMARY_ONLY_REVIEW_MARKER}`;
     const priorApprove = (sha: string, body: string) => [
       {
         id: 1,
@@ -1247,7 +1246,7 @@ describe("post-review action (runPostReview)", () => {
     ];
 
     it("skips the post when the body and verdict are byte-identical", async () => {
-      setPriorReviews(priorApprove("5491287206e7b6d11ffd6b8ca08b9c1747f2aac2", tagged(SUMMARY)));
+      setPriorReviews(priorApprove("5491287206e7b6d11ffd6b8ca08b9c1747f2aac2", SUMMARY));
       const taskId = "widget-42-dupe";
       seedFindings(taskId, "widget", { summary: SUMMARY, event: "APPROVE", findings: [] });
 
@@ -1261,7 +1260,7 @@ describe("post-review action (runPostReview)", () => {
     });
 
     it("edits the last APPROVE when a single word changed and nothing else did", async () => {
-      setPriorReviews(priorApprove("0ldsha0", tagged(SUMMARY)));
+      setPriorReviews(priorApprove("0ldsha0", SUMMARY));
       const taskId = "widget-42-dupe-differs";
       seedFindings(taskId, "widget", {
         summary: SUMMARY + " Nice work.",
@@ -1272,7 +1271,7 @@ describe("post-review action (runPostReview)", () => {
       const outcome = await executor.execute(NODE, {});
       expect(outcome.status).toBe("succeeded");
       expect(reviews).toHaveLength(0);
-      expect(edits).toEqual([{ reviewId: "1", body: { body: tagged(SUMMARY + " Nice work.") } }]);
+      expect(edits).toEqual([{ reviewId: "1", body: { body: SUMMARY + " Nice work." } }]);
       expect(outcome.results[0]!.output).toBe("updated review 1: no new findings, state APPROVED unchanged");
     });
 
@@ -1315,26 +1314,14 @@ describe("post-review action (runPostReview)", () => {
 
     it("edits the last COMMENTED review when a re-review finds nothing new", async () => {
       setPriorReviews([
-        { id: 7, state: "COMMENTED", commit_id: "0ldsha0", body: tagged("Old text."), submitted_at: "2026-08-05T20:14:46Z", user: { login: "last-light[bot]" } },
+        { id: 7, state: "COMMENTED", commit_id: "0ldsha0", body: "Old text.", submitted_at: "2026-08-05T20:14:46Z", user: { login: "last-light[bot]" } },
       ]);
       const taskId = "widget-42-edit-comment";
       seedFindings(taskId, "widget", { summary: "No additional issues.", event: "COMMENT", findings: [] });
       const { executor } = makeExecutor(taskId);
       expect((await executor.execute(NODE, {})).status).toBe("succeeded");
       expect(reviews).toHaveLength(0);
-      expect(edits).toEqual([{ reviewId: "7", body: { body: tagged("No additional issues.") } }]);
-    });
-
-    it("posts a new review when the last review body can hold open findings", async () => {
-      setPriorReviews([
-        { id: 7, state: "COMMENTED", commit_id: "0ldsha0", body: "Old text with a finding in the body.", submitted_at: "2026-08-05T20:14:46Z", user: { login: "last-light[bot]" } },
-      ]);
-      const taskId = "widget-42-untagged";
-      seedFindings(taskId, "widget", { summary: "No additional issues.", event: "COMMENT", findings: [] });
-      const { executor } = makeExecutor(taskId);
-      expect((await executor.execute(NODE, {})).status).toBe("succeeded");
-      expect(edits).toEqual([]);
-      expect(reviews).toHaveLength(1);
+      expect(edits).toEqual([{ reviewId: "7", body: { body: "No additional issues." } }]);
     });
 
     it("posts a new review when the state changes from COMMENTED to APPROVED", async () => {
@@ -1351,7 +1338,7 @@ describe("post-review action (runPostReview)", () => {
 
     it("posts a new review when the edit of the last review fails", async () => {
       setPriorReviews([
-        { id: 404, state: "COMMENTED", commit_id: "0ldsha0", body: tagged("Old text."), submitted_at: "2026-08-05T20:14:46Z", user: { login: "last-light[bot]" } },
+        { id: 404, state: "COMMENTED", commit_id: "0ldsha0", body: "Old text.", submitted_at: "2026-08-05T20:14:46Z", user: { login: "last-light[bot]" } },
       ]);
       const taskId = "widget-42-edit-fails";
       seedFindings(taskId, "widget", { summary: "No additional issues.", event: "COMMENT", findings: [] });
