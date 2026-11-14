@@ -1238,7 +1238,6 @@ async function main() {
                   issueNumber,
                   commentId: saved.githubCommentId,
                   save: (id) => persistHandle({ githubCommentId: id }),
-                  sticky: { workflow: workflowName, botLogin: config.botLogin },
                 }),
               );
             }

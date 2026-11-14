@@ -66,13 +66,11 @@ function startMock(): {
   server: Server;
   url: string;
   reviews: RecordedReview[];
-  edits: { reviewId: string; body: unknown }[];
   comparedBaseheads: string[];
   setCompareFiles: (files: string[]) => void;
   setPriorReviews: (reviews: unknown[]) => void;
 } {
   const reviews: RecordedReview[] = [];
-  const edits: { reviewId: string; body: unknown }[] = [];
   const comparedBaseheads: string[] = [];
   let compareFiles: string[] = [];
   let priorReviews: unknown[] = [];
@@ -88,21 +86,6 @@ function startMock(): {
         reviews.push({ owner: m[1]!, repo: m[2]!, pr: m[3]!, body: raw ? JSON.parse(raw) : {} });
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({ id: 1, state: "COMMENTED" }));
-      });
-      return;
-    }
-    const um = /^\/repos\/[^/]+\/[^/]+\/pulls\/[^/]+\/reviews\/([^/?]+)$/.exec(req.url || "");
-    if (req.method === "PUT" && um?.[1] === "404") {
-      res.writeHead(422, { "content-type": "application/json" }).end("{}");
-      return;
-    }
-    if (req.method === "PUT" && um) {
-      let raw = "";
-      req.on("data", (c) => (raw += c));
-      req.on("end", () => {
-        edits.push({ reviewId: um[1]!, body: raw ? JSON.parse(raw) : {} });
-        res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ id: Number(um[1]) }));
       });
       return;
     }
@@ -144,7 +127,6 @@ function startMock(): {
     server,
     url: "",
     reviews,
-    edits,
     comparedBaseheads,
     setCompareFiles: (files: string[]) => {
       compareFiles = files;
@@ -186,7 +168,6 @@ describe("post-review action (runPostReview)", () => {
   let server: Server;
   let baseUrl: string;
   let reviews: RecordedReview[];
-  let edits: { reviewId: string; body: unknown }[];
   let comparedBaseheads: string[];
   let setCompareFiles: (files: string[]) => void;
   let setPriorReviews: (reviews: unknown[]) => void;
@@ -197,7 +178,6 @@ describe("post-review action (runPostReview)", () => {
     const mock = startMock();
     server = mock.server;
     reviews = mock.reviews;
-    edits = mock.edits;
     comparedBaseheads = mock.comparedBaseheads;
     setCompareFiles = mock.setCompareFiles;
     setPriorReviews = mock.setPriorReviews;
@@ -1259,7 +1239,7 @@ describe("post-review action (runPostReview)", () => {
       expect(outcome.results[0]!.output).toMatch(/^duplicate: .* 5491287/);
     });
 
-    it("edits the last APPROVE when a single word changed and nothing else did", async () => {
+    it("posts when a single word changed — this is not a fuzzy match", async () => {
       setPriorReviews(priorApprove("0ldsha0", SUMMARY));
       const taskId = "widget-42-dupe-differs";
       seedFindings(taskId, "widget", {
@@ -1268,11 +1248,8 @@ describe("post-review action (runPostReview)", () => {
         findings: [],
       });
       const { executor } = makeExecutor(taskId);
-      const outcome = await executor.execute(NODE, {});
-      expect(outcome.status).toBe("succeeded");
-      expect(reviews).toHaveLength(0);
-      expect(edits).toEqual([{ reviewId: "1", body: { body: SUMMARY + " Nice work." } }]);
-      expect(outcome.results[0]!.output).toBe("updated review 1: no new findings, state APPROVED unchanged");
+      expect((await executor.execute(NODE, {})).status).toBe("succeeded");
+      expect(reviews).toHaveLength(1);
     });
 
     // The APPROVE restriction is the check run, not squeamishness: skipping the
@@ -1308,41 +1285,6 @@ describe("post-review action (runPostReview)", () => {
       const taskId = "widget-42-dupe-asked";
       seedFindings(taskId, "widget", { summary: SUMMARY, event: "APPROVE", findings: [] });
       const { executor } = makeExecutor(taskId, { explicitRequest: true });
-      expect((await executor.execute(NODE, {})).status).toBe("succeeded");
-      expect(reviews).toHaveLength(1);
-    });
-
-    it("edits the last COMMENTED review when a re-review finds nothing new", async () => {
-      setPriorReviews([
-        { id: 7, state: "COMMENTED", commit_id: "0ldsha0", body: "Old text.", submitted_at: "2026-08-05T20:14:46Z", user: { login: "last-light[bot]" } },
-      ]);
-      const taskId = "widget-42-edit-comment";
-      seedFindings(taskId, "widget", { summary: "No additional issues.", event: "COMMENT", findings: [] });
-      const { executor } = makeExecutor(taskId);
-      expect((await executor.execute(NODE, {})).status).toBe("succeeded");
-      expect(reviews).toHaveLength(0);
-      expect(edits).toEqual([{ reviewId: "7", body: { body: "No additional issues." } }]);
-    });
-
-    it("posts a new review when the state changes from COMMENTED to APPROVED", async () => {
-      setPriorReviews([
-        { id: 7, state: "COMMENTED", commit_id: "0ldsha0", body: SUMMARY, submitted_at: "2026-08-05T20:14:46Z", user: { login: "last-light[bot]" } },
-      ]);
-      const taskId = "widget-42-state-change";
-      seedFindings(taskId, "widget", { summary: SUMMARY, event: "APPROVE", findings: [] });
-      const { executor } = makeExecutor(taskId);
-      expect((await executor.execute(NODE, {})).status).toBe("succeeded");
-      expect(edits).toEqual([]);
-      expect(reviews).toHaveLength(1);
-    });
-
-    it("posts a new review when the edit of the last review fails", async () => {
-      setPriorReviews([
-        { id: 404, state: "COMMENTED", commit_id: "0ldsha0", body: "Old text.", submitted_at: "2026-08-05T20:14:46Z", user: { login: "last-light[bot]" } },
-      ]);
-      const taskId = "widget-42-edit-fails";
-      seedFindings(taskId, "widget", { summary: "No additional issues.", event: "COMMENT", findings: [] });
-      const { executor } = makeExecutor(taskId);
       expect((await executor.execute(NODE, {})).status).toBe("succeeded");
       expect(reviews).toHaveLength(1);
     });

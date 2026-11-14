@@ -610,34 +610,6 @@ export class GitHubClient {
   }
 
   /**
-   * Find the newest comment on an issue or PR that `botLogin` wrote and that
-   * contains `marker`. Returns its id, or `undefined` when there is none.
-   *
-   * The author check is necessary: a human can copy the hidden marker into a
-   * comment, and the bot must never edit the comment of a human.
-   */
-  async findBotCommentWithMarker(
-    owner: string,
-    repo: string,
-    issueNumber: number,
-    marker: string,
-    botLogin: string,
-  ): Promise<number | undefined> {
-    const kit = await this.kit(owner);
-    const comments = await kit.paginate(kit.rest.issues.listComments, {
-      owner,
-      repo,
-      issue_number: issueNumber,
-      per_page: 100,
-    });
-    for (let i = comments.length - 1; i >= 0; i--) {
-      const c = comments[i]!;
-      if (c.user?.login === botLogin && c.body?.includes(marker)) return c.id;
-    }
-    return undefined;
-  }
-
-  /**
    * Add labels to an issue/PR, leaving existing labels alone.
    *
    * One of exactly TWO harness-side label WRITEs — {@link removeLabel} is the
@@ -1909,7 +1881,7 @@ export class GitHubClient {
     botLogin = "last-light[bot]",
   ): Promise<{
     atHead: { state: string; body: string | null; submittedAt: string | null } | null;
-    latest: { id: number; state: string; sha: string; body: string | null; submittedAt: string | null } | null;
+    latest: { state: string; sha: string; body: string | null; submittedAt: string | null } | null;
     /**
      * Humans whose standing verdict is CHANGES_REQUESTED — their latest
      * APPROVED / CHANGES_REQUESTED / DISMISSED review, which is how GitHub
@@ -1937,13 +1909,12 @@ export class GitHubClient {
     // the time the review was submitted, which is exactly the discriminator
     // we want — re-pushes invalidate stale reviews here naturally.
     let atHead: { state: string; body: string | null; submittedAt: string | null } | null = null;
-    let latest: { id: number; state: string; sha: string; body: string | null; submittedAt: string | null } | null = null;
+    let latest: { state: string; sha: string; body: string | null; submittedAt: string | null } | null = null;
     for (let i = reviews.length - 1; i >= 0; i--) {
       const r = reviews[i]!;
       if (r.user?.login !== botLogin) continue;
       if (!latest && r.commit_id) {
         latest = {
-          id: r.id,
           state: r.state,
           sha: r.commit_id,
           body: r.body ?? null,
@@ -2255,22 +2226,6 @@ export class GitHubClient {
       ...(review.comments && review.comments.length ? { comments: review.comments } : {}),
       ...(review.commitId ? { commit_id: review.commitId } : {}),
     });
-  }
-
-  /**
-   * Replace the body of a review that was already submitted. GitHub keeps the
-   * state, the inline comments and the `commit_id` of the review. Only the body
-   * changes, and GitHub sends no new notification.
-   */
-  async updatePullRequestReview(
-    owner: string,
-    repo: string,
-    pullNumber: number,
-    reviewId: number,
-    body: string,
-  ): Promise<void> {
-    const kit = await this.kit(owner);
-    await kit.rest.pulls.updateReview({ owner, repo, pull_number: pullNumber, review_id: reviewId, body });
   }
 
   /**

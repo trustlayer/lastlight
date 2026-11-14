@@ -1,7 +1,7 @@
 import { isOwnedRun, type StateDb, type WorkflowRun } from "../state/db.js";
 import type { ExecutorConfig } from "../engine/github/profiles.js";
 import type { GitHubClient } from "../engine/github/github.js";
-import { getRuntimeConfig, type ModelConfig, type VariantConfig } from "../config/config.js";
+import type { ModelConfig, VariantConfig } from "../config/config.js";
 import { runWorkflow, type ApprovalGateConfig, type RunnerCallbacks } from "./runner.js";
 import { getWorkflow } from "./loader.js";
 import {
@@ -435,7 +435,6 @@ export async function resumeSimpleRun(run: WorkflowRun, opts: ResumeOptions): Pr
     try {
       const saved = ((run.scratch?.notifier) ?? {}) as NotifierState;
       const github = opts.github;
-      const botLogin = getRuntimeConfig()?.botLogin;
       // Fire-and-forget from the transport's synchronous `save` hook — see the
       // twin in index.ts. A lost handle only costs a fresh status comment.
       const persist = (patch: Partial<NotifierState>) => {
@@ -454,7 +453,6 @@ export async function resumeSimpleRun(run: WorkflowRun, opts: ResumeOptions): Pr
         issueNumber,
         commentId: saved.githubCommentId,
         save: (id) => persist({ githubCommentId: id }),
-        ...(botLogin ? { sticky: { workflow: run.workflowName, botLogin } } : {}),
       });
       const notifier = new ProgressNotifier([transport]);
       const completed = new Set(run.phaseHistory.map((h) => h.phase));

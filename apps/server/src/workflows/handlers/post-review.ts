@@ -952,24 +952,6 @@ export class GitHubPostReviewHandler implements PhaseTypeHandler {
       return succeed(repeat);
     }
 
-    // A run with no new finding and the same state as our last review edits
-    // the body of that review. It does not submit a new one. GitHub cannot
-    // change the state of a submitted review, so a change of state still posts.
-    const kept = this.reviewToEdit(history.latest, review, explicitRequest);
-    if (kept) {
-      try {
-        if (kept.body !== review.body) {
-          await github.updatePullRequestReview(owner, repo, prNumber, kept.id, review.body);
-        }
-        await this.persistLedger(ledger, hostRepoDir);
-        return succeed(
-          `updated review ${kept.id}: no new findings, state ${kept.state} unchanged`,
-        );
-      } catch (err) {
-        log.warn("Could not edit the last review; submitting a new one", { err });
-      }
-    }
-
     try {
       await github.createPullRequestReview(owner, repo, prNumber, {
         body: review.body,
@@ -1073,31 +1055,6 @@ export class GitHubPostReviewHandler implements PhaseTypeHandler {
     if (!last || last.state !== "APPROVED" || last.body !== review.body)
       return null;
     return `duplicate: this APPROVE is word-for-word the one we posted on ${last.sha.slice(0, 7)}`;
-  }
-
-  /**
-   * Find our last review when this review only repeats its verdict. Returns
-   * that review to edit, or `null` to submit a new one.
-   *
-   * All of these conditions are necessary:
-   *
-   * - The run is not an explicit request. A maintainer who asks for a review
-   *   gets a new review.
-   * - The review has no inline comment and no finding in the body.
-   * - The event is APPROVE or COMMENT, and our last review has the same state.
-   *   REQUEST_CHANGES always posts: the check run reads only the review at the
-   *   current head, and a missing review concludes `neutral`, which passes.
-   */
-  private reviewToEdit(
-    last: { id: number; state: string; body: string | null } | null,
-    review: { event: string; comments: unknown[]; demotedCount: number },
-    explicitRequest: boolean,
-  ): { id: number; state: string; body: string | null } | null {
-    if (explicitRequest || !last) return null;
-    if (review.comments.length > 0 || review.demotedCount > 0) return null;
-    const state =
-      review.event === "APPROVE" ? "APPROVED" : review.event === "COMMENT" ? "COMMENTED" : null;
-    return state !== null && last.state === state ? last : null;
   }
 
   /**
